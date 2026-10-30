@@ -1,0 +1,351 @@
+#!/bin/sh
+# Turns a LAN port that is cabled to the Internet into the node's WAN port.
+# The promoted port simply BECOMES the stock "wan" interface, so everything
+# else is unmodified LibreMesh: watchping (system.watchping on "wan") runs the
+# wan-ok.d/wan-fail.d hooks and babeld-auto-gw-mode announces the default
+# route to the mesh. LibreMesh has no LAN-port detection of its own.
+CFG=picot-autowan
+RUN=/var/run/picot-autowan
+
+# udhcpc hook: called by udhcpc itself ("bound"/"renew"...). DHCP replies come
+# from an untrusted peer, so only store them; they are validated by the caller.
+case "${1:-}" in
+    bound|renew)
+        [ -n "${LEASE_FILE:-}" ] || exit 0
+        {
+            echo "ip=$ip"
+            echo "mask=$subnet"
+            echo "router=${router%% *}"
+        } > "$LEASE_FILE"
+        exit 0
+        ;;
+    deconfig|leasefail|nak) exit 0 ;;
+esac
+
+log() {
+    logger -t picot-autowan "$*"
+    echo "$*"
+}
+
+opt() {
+    uci -q get "$CFG.settings.$1" 2>/dev/null || echo "$2"
+}
+
+is_ipv4() {
+    printf '%s' "$1" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'
+}
+
+state_get() {
+    uci -q get "$CFG.settings.$1" 2>/dev/null || true
+}
+
+state_set() {
+    uci set "$CFG.settings.$1=$2"
+    uci commit "$CFG"
+}
+
+state_clear() {
+    for key in "$@"; do
+        uci -q delete "$CFG.settings.$key" || true
+    done
+    uci commit "$CFG"
+}
+
+bridge_section() {
+    uci show network 2>/dev/null |
+        sed -n "s/^\\(network\\.[^.=]*\\)\\.name='br-lan'\$/\\1/p" | head -n 1
+}
+
+wan_zone_section() {
+    for zone in $(uci show firewall 2>/dev/null |
+        sed -n "s/^\\(firewall\\.[^.=]*\\)\\.name='wan'\$/\\1/p"); do
+        [ "$(uci -q get "$zone")" = zone ] && { echo "$zone"; return 0; }
+    done
+    return 1
+}
+
+is_excluded() {
+    for skip in $(opt exclude_ports ""); do
+        [ "$skip" = "$1" ] && return 0
+    done
+    return 1
+}
+
+# Physical Ethernet ports currently bridged into br-lan.
+candidates() {
+    sec=$(bridge_section)
+    [ -n "$sec" ] || return 0
+    for port in $(uci -q get "$sec.ports" 2>/dev/null); do
+        case "$port" in
+            ''|bat*|wlan*|*.*|*@*|anygw*) continue ;;
+        esac
+        [ -d "/sys/class/net/$port" ] || continue
+        if [ -d "/sys/class/net/$port/wireless" ] ||
+           [ -d "/sys/class/net/$port/phy80211" ]; then
+            continue
+        fi
+        case "$(readlink -f "/sys/class/net/$port")" in
+            */virtual/*) continue ;;
+        esac
+        is_excluded "$port" && continue
+        echo "$port"
+    done
+}
+
+carrier() {
+    cat "/sys/class/net/$1/carrier" 2>/dev/null || echo 0
+}
+
+# Only act when the node has no working uplink of its own: either no "wan"
+# interface exists (Aruba AP-303) or its physical port has no cable. LibreMesh's
+# gateway hooks only follow the interface named "wan", so one uplink per node.
+uplink_free() {
+    [ -z "$(state_get promoted_port)" ] || return 1
+    if uci -q get network.wan >/dev/null 2>&1; then
+        [ "$(uci -q get network.wan.proto)" = dhcp ] || return 1
+        dev=$(uci -q get network.wan.device || true)
+        [ -n "$dev" ] || return 1
+        [ "$(carrier "$dev")" = 1 ] && return 1
+    fi
+    return 0
+}
+
+reload_services() {
+    /etc/init.d/network reload
+    /etc/init.d/firewall reload
+}
+
+# Probe a port: detach it from the LAN bridge, ask for DHCP, and require a
+# lease outside the mesh subnet plus real Internet reachability through it.
+# Detached ports are always reattached on failure.
+probe_port() {
+    port=$1
+    lease=$(mktemp)
+    secs=$(opt probe_seconds 4)
+    hosts=$(opt ping_hosts "1.1.1.1 9.9.9.9")
+
+    ip link set dev "$port" nomaster 2>/dev/null || { rm -f "$lease"; return 1; }
+    ip link set dev "$port" up
+    LEASE_FILE=$lease udhcpc -i "$port" -n -q -f -t "$secs" -T 2 \
+        -s /usr/sbin/picot-autowan >/dev/null 2>&1 || true
+
+    lease_ip=$(sed -n 's/^ip=//p' "$lease" | head -n 1)
+    lease_mask=$(sed -n 's/^mask=//p' "$lease" | head -n 1)
+    lease_router=$(sed -n 's/^router=//p' "$lease" | head -n 1)
+    rm -f "$lease"
+
+    ok=0
+    if is_ipv4 "$lease_ip" && is_ipv4 "$lease_mask" && is_ipv4 "$lease_router"; then
+        lan_ip=$(uci -q get network.lan.ipaddr || true)
+        lan_mask=$(uci -q get network.lan.netmask || true)
+        mesh_net=$(ipcalc.sh "$lan_ip" "$lan_mask" 2>/dev/null | sed -n 's/^NETWORK=//p')
+        lease_net=$(ipcalc.sh "$lease_ip" "$lan_mask" 2>/dev/null | sed -n 's/^NETWORK=//p')
+        if [ -n "$mesh_net" ] && [ "$mesh_net" = "$lease_net" ]; then
+            log "$port: DHCP offer is inside the mesh subnet, treating as LAN"
+        else
+            ip addr add "$lease_ip/$lease_mask" dev "$port" 2>/dev/null || true
+            for host in $hosts; do
+                is_ipv4 "$host" || continue
+                ip route replace "$host/32" via "$lease_router" dev "$port" 2>/dev/null || continue
+                if ping -c 2 -W 3 -I "$port" "$host" >/dev/null 2>&1; then
+                    ok=1
+                fi
+                ip route del "$host/32" via "$lease_router" dev "$port" 2>/dev/null || true
+                [ "$ok" = 1 ] && break
+            done
+            ip addr flush dev "$port" 2>/dev/null || true
+        fi
+    else
+        log "$port: no valid DHCP lease, treating as LAN"
+    fi
+
+    if [ "$ok" != 1 ]; then
+        ip link set dev "$port" master br-lan 2>/dev/null || true
+        return 1
+    fi
+    return 0
+}
+
+promote_port() {
+    port=$1
+    sec=$(bridge_section)
+    zone=$(wan_zone_section) || { log "no firewall wan zone; cannot promote $port"; return 1; }
+    [ -n "$sec" ] || return 1
+
+    state_set promoted_port "$port"
+    if uci -q get network.wan >/dev/null 2>&1; then
+        state_set had_wan 1
+        orig=$(uci -q get network.wan.device || true)
+        [ -z "$orig" ] || state_set orig_device "$orig"
+    else
+        state_set had_wan 0
+    fi
+
+    uci -q del_list "$sec.ports=$port" || true
+    uci set network.wan=interface
+    uci set network.wan.device="$port"
+    uci set network.wan.proto=dhcp
+    case " $(uci -q get "$zone.network" || true) " in
+        *" wan "*) ;;
+        *) uci add_list "$zone.network=wan"; state_set zone_added 1 ;;
+    esac
+    uci commit network
+    uci commit firewall
+    reload_services
+
+    # LibreMesh creates system.watchping for "wan"; recreate it if it is gone.
+    if ! uci -q get system.watchping >/dev/null 2>&1; then
+        uci set system.watchping=watchping
+        uci set system.watchping.interface=wan
+        uci set system.watchping.timeout=2m
+        uci set system.watchping.pinghosts=8.8.8.8
+        uci set system.watchping.pinginterval=20s
+        uci commit system
+    fi
+    [ -x /etc/init.d/watchping ] && /etc/init.d/watchping restart
+    log "$port is now the WAN port (interface wan)"
+}
+
+demote_port() {
+    port=$(state_get promoted_port)
+    [ -n "$port" ] || return 0
+    sec=$(bridge_section)
+    zone=$(wan_zone_section || true)
+    orig=$(state_get orig_device)
+
+    if [ "$(state_get had_wan)" = 1 ] && [ -n "$orig" ]; then
+        uci set network.wan.device="$orig"
+    else
+        uci -q delete network.wan || true
+    fi
+    if [ "$(state_get zone_added)" = 1 ] && [ -n "$zone" ]; then
+        uci -q del_list "$zone.network=wan" || true
+    fi
+    if [ -n "$sec" ]; then
+        uci -q del_list "$sec.ports=$port" || true
+        uci add_list "$sec.ports=$port"
+    fi
+    state_clear promoted_port had_wan orig_device zone_added
+    uci commit network
+    uci commit firewall
+    reload_services
+    rm -f "$RUN"/link.* "$RUN"/down
+    log "$port returned to the LAN bridge"
+}
+
+# After lime-config regenerates br-lan the promoted port could reappear there.
+reconcile() {
+    port=$(state_get promoted_port)
+    sec=$(bridge_section)
+    [ -n "$port" ] && [ -n "$sec" ] || return 0
+    case " $(uci -q get "$sec.ports" || true) " in
+        *" $port "*)
+            uci -q del_list "$sec.ports=$port" || true
+            uci commit network
+            reload_services
+            log "$port removed from br-lan again (it is the WAN port)"
+            ;;
+    esac
+}
+
+run_daemon() {
+    [ "$(opt enabled 0)" = 1 ] || exit 0
+    mkdir -p "$RUN"
+    down_limit=$(opt down_seconds 20)
+    uptime_s=$(cut -d. -f1 /proc/uptime)
+    # Ports already cabled when started by hand may carry the admin session,
+    # so they are only probed at boot or after the link bounces.
+    boot_probe=0
+    [ "$uptime_s" -lt 300 ] && boot_probe=1
+    reconcile
+
+    while :; do
+        promoted=$(state_get promoted_port)
+        if [ -n "$promoted" ]; then
+            if [ "$(carrier "$promoted")" = 1 ]; then
+                rm -f "$RUN/down"
+            else
+                count=$(cat "$RUN/down" 2>/dev/null || echo 0)
+                count=$((count + 3))
+                echo "$count" > "$RUN/down"
+                [ "$count" -lt "$down_limit" ] || demote_port
+            fi
+            sleep 3
+            continue
+        fi
+
+        for port in $(candidates); do
+            state="$RUN/link.$port"
+            now=$(carrier "$port")
+            if [ ! -f "$state" ]; then
+                if [ "$boot_probe" = 1 ]; then echo 0 > "$state"; else echo "$now" > "$state"; fi
+            fi
+            before=$(cat "$state")
+            echo "$now" > "$state"
+            if [ "$now" = 1 ] && [ "$before" != 1 ] && uplink_free; then
+                sleep 2
+                log "$port: link up, probing for an Internet uplink"
+                if probe_port "$port"; then
+                    promote_port "$port" || true
+                    break
+                fi
+            fi
+        done
+
+        sleep 3
+    done
+}
+
+show_status() {
+    echo "enabled: $(opt enabled 0)"
+    echo "promoted WAN port: $(state_get promoted_port)"
+    echo "wan interface device: $(uci -q get network.wan.device || echo none)"
+    echo "watchping: $(uci -q get system.watchping.interface || echo missing)"
+    echo "candidate LAN ports:"
+    for port in $(candidates); do
+        echo "  $port carrier=$(carrier "$port")"
+    done
+}
+
+check_tools() {
+    missing=""
+    for tool in uci ip udhcpc ping ipcalc.sh jsonfilter ifstatus logger watchping; do
+        command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+    done
+    [ -d /sys/class/net/bat0 ] || missing="$missing bat0"
+    [ -z "$missing" ] || { echo "ERROR: missing:$missing" >&2; return 1; }
+    echo "picot-autowan prerequisites are present."
+}
+
+configure() {
+    touch "/etc/config/$CFG"
+    uci -q get "$CFG.settings" >/dev/null 2>&1 || uci set "$CFG.settings=autowan"
+    case "$1" in
+        enable)
+            uci set "$CFG.settings.enabled=1"
+            [ -n "$(uci -q get "$CFG.settings.probe_seconds")" ] || uci set "$CFG.settings.probe_seconds=4"
+            [ -n "$(uci -q get "$CFG.settings.down_seconds")" ] || uci set "$CFG.settings.down_seconds=20"
+            [ -n "$(uci -q get "$CFG.settings.ping_hosts")" ] || uci set "$CFG.settings.ping_hosts=1.1.1.1 9.9.9.9"
+            ;;
+        disable) uci set "$CFG.settings.enabled=0" ;;
+        *) echo "Usage: $0 configure enable|disable" >&2; exit 2 ;;
+    esac
+    uci commit "$CFG"
+}
+
+demote_all() {
+    demote_port
+    echo "The promoted WAN port (if any) is back in the LAN bridge."
+}
+
+case "${1:-}" in
+    run) run_daemon ;;
+    status) show_status ;;
+    check) check_tools ;;
+    configure) configure "${2:-}" ;;
+    demote-all) demote_all ;;
+    *)
+        echo "Usage: $0 {run|status|check|configure enable|disable|demote-all}" >&2
+        exit 2
+        ;;
+esac

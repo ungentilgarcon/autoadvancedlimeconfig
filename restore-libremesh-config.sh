@@ -2,31 +2,25 @@
 set -eu
 
 BASE=/root/libremesh-failsafe
-SOURCE=${1:-picot0}
+SOURCE=${1:-saved}
 
 board=$(ubus call system board 2>/dev/null | jsonfilter -e '@.board_name' 2>/dev/null || true)
 [ -n "$board" ] || board=$(cat /tmp/sysinfo/board_name 2>/dev/null || true)
 host=$(hostname)
 
 case "$SOURCE" in
-    picot0)
-        [ "$board" = "xiaomi,redmi-router-ax6000-ubootmod" ] || {
-            echo "Refusing PICOT0 backup on unexpected board: $board" >&2
-            exit 1
-        }
-        [ "$host" = "PICOT0" ] || {
-            echo "Refusing PICOT0 backup on host '$host' (expected PICOT0)" >&2
-            exit 1
-        }
+    saved|picot0)
         ARCHIVE=$BASE/picot0-config.tar.gz
-        CONFIRM=RESTORE-PICOT0
+        CONFIRM=RESTORE-SAVED
+        echo "Saved failsafe config will be applied to board '$board', host '$host'."
+        echo "It keeps the hostname/IPs of the node it was taken from."
         ;;
     live)
         ARCHIVE=$BASE/live-config.tar.gz
         CONFIRM=RESTORE-LIVE
         ;;
     *)
-        echo "Usage: $0 [picot0|live]" >&2
+        echo "Usage: $0 [saved|live]" >&2
         exit 2
         ;;
 esac

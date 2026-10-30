@@ -26,9 +26,10 @@ ROOT = Path(__file__).resolve().parent
 SELECTOR = "https://firmware-selector.libremesh.org"
 DEFAULT_EXTRAS_FILE = ROOT / "firmware-selector-packages.txt"
 DEFAULT_PASS_FILE = ROOT / ".pass"
-FAILSAFE_DIR = ROOT / "backup-PICOT0-2026-10-30"
 VLAN_SCRIPT = ROOT / "apply-libremesh-vlans.sh"
 VLAN_RECOVERY_SCRIPT = ROOT / "picot-vlan-recovery"
+AUTOWAN_SCRIPT = ROOT / "picot-autowan"
+AUTOWAN_INIT = ROOT / "picot-autowan.init"
 USER_AGENT = "libremesh-deploy/1.0"
 DEVICES = {
     "redmi-ax6000-ubootmod": {
@@ -46,6 +47,39 @@ DEVICES = {
 
 class DeployError(Exception):
     pass
+
+
+def _ssh_command(program: str) -> list[str]:
+    command = [program, "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes"]
+    # Optional alternate ssh_config (used by the emulator testbed); the
+    # security options above always stay in force.
+    config = os.environ.get("LIBREMESH_SSH_CONFIG")
+    if config:
+        command[1:1] = ["-F", config]
+    return command
+
+
+SSH_CMD = _ssh_command("ssh")
+SCP_CMD = _ssh_command("scp")
+
+
+def normalize_board(name: str) -> str:
+    return name.strip().replace(",", "_")
+
+
+def resolve_device(name: str, target: str | None = None) -> dict:
+    """Return a device description from a shortcut alias or any OpenWrt name.
+
+    Any OpenWrt board name (aruba,ap-303) or Selector profile id (aruba_ap-303)
+    is accepted; the build target is discovered from the Selector when omitted.
+    """
+    if name in DEVICES:
+        return dict(DEVICES[name])
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9,_.+-]*", name):
+        raise DeployError(f"Invalid device name: {name!r}")
+    if target is not None and not re.fullmatch(r"[a-z0-9_-]+/[a-z0-9_-]+", target):
+        raise DeployError(f"Invalid --target: {target!r}")
+    return {"profile": normalize_board(name), "target": target, "board": name}
 
 
 def http_json(url: str, data: dict | None = None, timeout: int = 60) -> tuple[int, dict]:
@@ -246,19 +280,31 @@ def fetch_profile(config: dict, version: str, device: dict) -> tuple[dict, dict,
         profile
         for profile in overview.get("profiles", [])
         if profile.get("id") == device["profile"]
-        and profile.get("target") == device["target"]
+        and (device["target"] is None or profile.get("target") == device["target"])
     ]
+    if len(matches) > 1:
+        targets = ", ".join(sorted(str(match.get("target")) for match in matches))
+        raise DeployError(
+            f"{device['profile']} exists for several targets ({targets}); "
+            "choose one with --target"
+        )
     if len(matches) != 1:
         raise DeployError(
-            f"{device['profile']} for {device['target']} is not uniquely available "
-            f"in OpenWrt {version}"
+            f"{device['profile']} is not available in OpenWrt {version}"
+            + (f" for {device['target']}" if device["target"] else "")
         )
+    device["target"] = matches[0]["target"]
     profile_index = http_json(
         f"{base}/targets/{device['target']}/profiles.json"
     )[1]
     profile = profile_index.get("profiles", {}).get(device["profile"])
     if not profile:
         raise DeployError(f"Profile details missing for {device['profile']}")
+    supported = profile.get("supported_devices") or []
+    if supported and normalize_board(device["board"]) not in {
+        normalize_board(item) for item in supported
+    }:
+        device["board"] = supported[0]
     return overview, profile_index, profile
 
 
@@ -277,7 +323,7 @@ def build_image(args: argparse.Namespace) -> Path | None:
             f"Unsupported LibreMesh feed branch {args.feed_branch!r}; "
             f"Selector supports: {', '.join(feed_branches)}"
         )
-    device = DEVICES[args.device]
+    device = resolve_device(args.device, getattr(args, "target", None))
     overview, profile_index, profile = fetch_profile(config, version, device)
     packages = unique(
         list(profile_index.get("default_packages", []))
@@ -434,10 +480,10 @@ def build_image(args: argparse.Namespace) -> Path | None:
     return output
 
 
-def create_failsafe_archive() -> Path:
-    config_dir = FAILSAFE_DIR / "etc" / "config"
+def create_failsafe_archive(failsafe_dir: Path) -> Path:
+    config_dir = failsafe_dir.expanduser().resolve() / "etc" / "config"
     if not config_dir.is_dir():
-        raise DeployError(f"PICOT0 failsafe config directory missing: {config_dir}")
+        raise DeployError(f"Failsafe config directory missing: {config_dir}")
     for required in ("network", "wireless", "lime-node", "firewall", "dhcp"):
         if not (config_dir / required).is_file():
             raise DeployError(f"Failsafe backup is missing etc/config/{required}")
@@ -462,9 +508,13 @@ def create_failsafe_archive() -> Path:
     return archive_path
 
 
-def run_command(command: list[str], *, check: bool = True) -> subprocess.CompletedProcess:
+def run_command(
+    command: list[str], *, check: bool = True, capture: bool = False
+) -> subprocess.CompletedProcess:
     try:
-        result = subprocess.run(command, check=False)
+        result = subprocess.run(
+            command, check=False, capture_output=capture, text=capture
+        )
     except FileNotFoundError as error:
         raise DeployError(f"Required command not found: {command[0]}") from error
     if check and result.returncode:
@@ -477,21 +527,34 @@ def run_command(command: list[str], *, check: bool = True) -> subprocess.Complet
 
 def ssh(host: str, remote_command: str) -> None:
     run_command([
-        "ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
+        *SSH_CMD,
         host, remote_command,
     ])
 
 
-def check_remote_board(host: str, device: dict) -> None:
-    preflight = (
-        "set -eu; "
-        "board=$(ubus call system board 2>/dev/null | "
-        "jsonfilter -e '@.board_name' 2>/dev/null || true); "
-        "[ -n \"$board\" ] || board=$(cat /tmp/sysinfo/board_name 2>/dev/null || true); "
-        f"[ \"$board\" = {shlex.quote(device['board'])} ] || "
-        "{ echo \"Wrong board: $board\" >&2; exit 20; }"
+REMOTE_BOARD_CMD = (
+    "board=$(ubus call system board 2>/dev/null | "
+    "jsonfilter -e '@.board_name' 2>/dev/null || true); "
+    "[ -n \"$board\" ] || board=$(cat /tmp/sysinfo/board_name 2>/dev/null || true); "
+)
+
+
+def check_remote_board(host: str, device: dict) -> str:
+    wanted = normalize_board(device["board"])
+    result = run_command(
+        [
+            *SSH_CMD,
+            host, "set -eu; " + REMOTE_BOARD_CMD + "printf '%s' \"$board\"",
+        ],
+        capture=True,
     )
-    ssh(host, preflight)
+    board = result.stdout.strip()
+    if normalize_board(board) != wanted:
+        raise DeployError(
+            f"Wrong board on {host}: device reports {board or 'nothing'!r}, "
+            f"expected {device['board']!r}"
+        )
+    return board
 
 
 def read_vlan_enabled(path: Path) -> bool:
@@ -543,13 +606,36 @@ def read_equipment_pass(path: Path, require_vlan_keys: bool = True) -> dict[str,
 
 
 def configure_vlans(args: argparse.Namespace) -> None:
-    device = DEVICES[args.device]
-    config_path = args.config.expanduser().resolve()
-    if not config_path.is_file():
-        raise DeployError(f"VLAN config file not found: {config_path}")
-    pass_values = read_equipment_pass(
-        args.pass_file, require_vlan_keys=read_vlan_enabled(config_path)
-    )
+    device = resolve_device(args.device, getattr(args, "target", None))
+    disable_config: Path | None = None
+    if args.disable:
+        if args.config:
+            raise DeployError("--disable and --config cannot be combined")
+        handle, name = tempfile.mkstemp(prefix="libremesh-vlan-off-", suffix=".conf")
+        with os.fdopen(handle, "w", encoding="ascii") as output:
+            output.write("config vlan 'settings'\n\toption enabled '0'\n\toption role 'edge'\n")
+        disable_config = Path(name)
+        config_path = disable_config
+        pass_values: dict[str, str] = {}
+    else:
+        if not args.config:
+            raise DeployError("--config is required unless --disable is used")
+        config_path = args.config.expanduser().resolve()
+        if not config_path.is_file():
+            raise DeployError(f"VLAN config file not found: {config_path}")
+        pass_values = read_equipment_pass(
+            args.pass_file, require_vlan_keys=read_vlan_enabled(config_path)
+        )
+    try:
+        _configure_vlans(args, device, config_path, pass_values)
+    finally:
+        if disable_config:
+            disable_config.unlink(missing_ok=True)
+
+
+def _configure_vlans(
+    args: argparse.Namespace, device: dict, config_path: Path, pass_values: dict[str, str]
+) -> None:
     if not VLAN_SCRIPT.is_file():
         raise DeployError(f"VLAN apply script not found: {VLAN_SCRIPT}")
     if not VLAN_RECOVERY_SCRIPT.is_file():
@@ -563,7 +649,7 @@ def configure_vlans(args: argparse.Namespace) -> None:
     def cleanup_remote_uploads() -> str:
         cleanup = run_command(
             [
-                "ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
+                *SSH_CMD,
                 args.host,
                 f"rm -f {remote_config} {remote_pass} "
                 "/tmp/apply-libremesh-vlans.sh /tmp/picot-vlan-recovery",
@@ -581,11 +667,11 @@ def configure_vlans(args: argparse.Namespace) -> None:
     try:
         ssh(args.host, f"mkdir -p {remote_dir}")
         run_command([
-            "scp", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
+            *SCP_CMD,
             str(VLAN_SCRIPT), f"{args.host}:/tmp/apply-libremesh-vlans.sh",
         ])
         run_command([
-            "scp", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
+            *SCP_CMD,
             str(config_path), f"{args.host}:{remote_config}",
         ])
         pass_fd, pass_name = tempfile.mkstemp(prefix="libremesh-vlan-", suffix=".pass")
@@ -596,13 +682,13 @@ def configure_vlans(args: argparse.Namespace) -> None:
                 output.write(f"IOT_WIFI_KEY={pass_values.get('IOT_WIFI_KEY', '')}\n")
                 output.write(f"GUEST_WIFI_KEY={pass_values.get('GUEST_WIFI_KEY', '')}\n")
             run_command([
-                "scp", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
+                *SCP_CMD,
                 str(pass_bundle), f"{args.host}:{remote_pass}",
             ])
         finally:
             pass_bundle.unlink(missing_ok=True)
         run_command([
-            "scp", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
+            *SCP_CMD,
             str(VLAN_RECOVERY_SCRIPT), f"{args.host}:/tmp/picot-vlan-recovery",
         ])
         ssh(
@@ -647,8 +733,51 @@ def configure_vlans(args: argparse.Namespace) -> None:
         ) from error
 
 
+def manage_autowan(args: argparse.Namespace) -> None:
+    device = resolve_device(args.device, None)
+    check_remote_board(args.host, device)
+    if args.action == "status":
+        ssh(args.host, "test -x /usr/sbin/picot-autowan && /usr/sbin/picot-autowan status")
+        return
+    if args.action == "disable":
+        ssh(
+            args.host,
+            "set -eu; test -x /usr/sbin/picot-autowan; "
+            "/usr/sbin/picot-autowan configure disable; "
+            "/etc/init.d/picot-autowan stop || true; "
+            "/etc/init.d/picot-autowan disable || true; "
+            "/usr/sbin/picot-autowan demote-all",
+        )
+        print("Automatic WAN detection disabled; promoted ports returned to the LAN bridge.")
+        return
+    for path in (AUTOWAN_SCRIPT, AUTOWAN_INIT):
+        if not path.is_file():
+            raise DeployError(f"Missing file: {path}")
+    for path, remote in ((AUTOWAN_SCRIPT, "/tmp/picot-autowan"), (AUTOWAN_INIT, "/tmp/picot-autowan.init")):
+        run_command([
+            *SCP_CMD,
+            str(path), f"{args.host}:{remote}",
+        ])
+    ssh(
+        args.host,
+        "set -eu; "
+        "install -m 755 /tmp/picot-autowan /usr/sbin/picot-autowan; "
+        "install -m 755 /tmp/picot-autowan.init /etc/init.d/picot-autowan; "
+        "rm -f /tmp/picot-autowan /tmp/picot-autowan.init; "
+        "/usr/sbin/picot-autowan check; "
+        "/usr/sbin/picot-autowan configure enable; "
+        "for p in /usr/sbin/picot-autowan /etc/init.d/picot-autowan "
+        "/etc/config/picot-autowan; do "
+        "grep -qxF \"$p\" /etc/sysupgrade.conf 2>/dev/null || "
+        "echo \"$p\" >> /etc/sysupgrade.conf; done; "
+        "/etc/init.d/picot-autowan enable; "
+        "/etc/init.d/picot-autowan restart",
+    )
+    print("Automatic WAN detection is running. Check with: autowan --action status")
+
+
 def finish_vlan_change(args: argparse.Namespace, action: str) -> None:
-    device = DEVICES[args.device]
+    device = resolve_device(args.device, getattr(args, "target", None))
     if not re.fullmatch(r"\d{14}-\d+", args.change_id):
         raise DeployError("Invalid VLAN change ID")
     check_remote_board(args.host, device)
@@ -661,7 +790,7 @@ def finish_vlan_change(args: argparse.Namespace, action: str) -> None:
 
 
 def stage_image(args: argparse.Namespace, image_path: Path) -> None:
-    device = DEVICES[args.device]
+    device = resolve_device(args.device, getattr(args, "target", None))
     image_path = image_path.expanduser().resolve()
     if not image_path.is_file():
         raise DeployError(f"Firmware image not found: {image_path}")
@@ -672,38 +801,24 @@ def stage_image(args: argparse.Namespace, image_path: Path) -> None:
     remote_image = f"/tmp/{image_path.name}"
     backup_path: Path | None = None
     try:
-        if args.device == "redmi-ax6000-ubootmod":
-            backup_path = create_failsafe_archive()
+        if getattr(args, "failsafe_dir", None):
+            backup_path = create_failsafe_archive(args.failsafe_dir)
         print(f"Checking SSH access and board identity on {args.host}...")
-        preflight = (
-            "set -eu; "
-            "board=$(ubus call system board 2>/dev/null | "
-            "jsonfilter -e '@.board_name' 2>/dev/null || true); "
-            "[ -n \"$board\" ] || board=$(cat /tmp/sysinfo/board_name 2>/dev/null || true); "
-            f"[ \"$board\" = {shlex.quote(device['board'])} ] || "
-            "{ echo \"Wrong board: $board\" >&2; exit 20; }; "
-            + (
-                "[ \"$(hostname)\" = PICOT0 ] || "
-                "{ echo 'PICOT0 backup is restricted to the PICOT0 hostname' >&2; exit 21; }; "
-                if backup_path
-                else ""
-            )
-        )
-        ssh(args.host, preflight)
+        remote_board = check_remote_board(args.host, device)
 
         print("Copying firmware and rollback helper...")
         run_command([
-            "scp", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
+            *SCP_CMD,
             str(image_path), f"{args.host}:{remote_image}",
         ])
         run_command([
-            "scp", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
+            *SCP_CMD,
             str(ROOT / "restore-libremesh-config.sh"),
             f"{args.host}:/tmp/restore-libremesh-config.sh",
         ])
         if backup_path:
             run_command([
-                "scp", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
+                *SCP_CMD,
                 str(backup_path), f"{args.host}:/tmp/picot0-config.tar.gz",
             ])
 
@@ -741,14 +856,14 @@ def stage_image(args: argparse.Namespace, image_path: Path) -> None:
         print("The current config has been backed up and added to sysupgrade.conf.")
         if backup_path:
             print(
-                "The saved PICOT0 config is installed at "
+                "The saved failsafe config is installed at "
                 f"{remote_dir}/picot0-config.tar.gz."
             )
         print(f"Firmware SHA-256: {digest}")
         if args.flash:
             if not sys.stdin.isatty():
                 raise DeployError("--flash requires an interactive terminal")
-            confirmation = f"FLASH {device['board']}"
+            confirmation = f"FLASH {remote_board}"
             print(f"This will reboot the device and install {image_path.name}.")
             print(f"Type exactly '{confirmation}' to continue:")
             if input("> ").strip() != confirmation:
@@ -763,6 +878,26 @@ def stage_image(args: argparse.Namespace, image_path: Path) -> None:
     finally:
         if backup_path:
             backup_path.unlink(missing_ok=True)
+
+
+def add_device_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--device",
+        required=True,
+        metavar="DEVICE",
+        help="OpenWrt board name (e.g. aruba,ap-303), Selector profile id "
+        "(aruba_ap-303), or shortcut: " + ", ".join(sorted(DEVICES)),
+    )
+
+
+def add_failsafe_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--failsafe-dir",
+        type=Path,
+        help="Optional known-good backup directory containing etc/config "
+        "(for example backup-PICOT0-2026-10-30); installed on the device as "
+        "the 'saved' restore source",
+    )
 
 
 def add_package_options(parser: argparse.ArgumentParser) -> None:
@@ -781,7 +916,12 @@ def add_package_options(parser: argparse.ArgumentParser) -> None:
 
 
 def add_build_options(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--device", required=True, choices=sorted(DEVICES))
+    add_device_option(parser)
+    parser.add_argument(
+        "--target",
+        help="Build target such as ipq40xx/generic; only needed if the profile "
+        "exists for several targets",
+    )
     parser.add_argument(
         "--version",
         default="latest",
@@ -822,9 +962,10 @@ def main() -> int:
     add_build_options(build)
 
     stage = commands.add_parser("stage", help="Stage an existing image and failsafes")
-    stage.add_argument("--device", required=True, choices=sorted(DEVICES))
+    add_device_option(stage)
     stage.add_argument("--host", required=True, help="SSH host, for example root@PICOT0")
     stage.add_argument("--image", required=True, type=Path)
+    add_failsafe_option(stage)
     stage.add_argument(
         "--flash",
         action="store_true",
@@ -834,6 +975,7 @@ def main() -> int:
     deploy = commands.add_parser("deploy", help="Build, stage, and optionally flash")
     add_build_options(deploy)
     deploy.add_argument("--host", required=True, help="SSH host, for example root@PICOT0")
+    add_failsafe_option(deploy)
     deploy.add_argument(
         "--flash",
         action="store_true",
@@ -842,11 +984,17 @@ def main() -> int:
 
     vlans = commands.add_parser(
         "vlans",
-        help="Validate or apply an optional per-node VLAN configuration",
+        help="Validate, apply or disable (--disable) an optional per-node VLAN configuration",
     )
-    vlans.add_argument("--device", required=True, choices=sorted(DEVICES))
+    add_device_option(vlans)
     vlans.add_argument("--host", required=True, help="SSH host, for example root@PICOT0")
-    vlans.add_argument("--config", required=True, type=Path, help="Private per-node UCI config")
+    vlans.add_argument("--config", type=Path, help="Private per-node UCI config")
+    vlans.add_argument(
+        "--disable",
+        action="store_true",
+        help="Return this node to normal behaviour without VLANs (still meshes "
+        "with VLAN nodes); same timed rollback/confirm flow as enabling",
+    )
     vlans.add_argument(
         "--pass-file",
         type=Path,
@@ -862,16 +1010,26 @@ def main() -> int:
     vlan_confirm = commands.add_parser(
         "vlan-confirm", help="Confirm a VLAN change before automatic rollback"
     )
-    vlan_confirm.add_argument("--device", required=True, choices=sorted(DEVICES))
+    add_device_option(vlan_confirm)
     vlan_confirm.add_argument("--host", required=True)
     vlan_confirm.add_argument("--change-id", required=True)
 
     vlan_rollback = commands.add_parser(
         "vlan-rollback", help="Immediately roll back a pending VLAN change"
     )
-    vlan_rollback.add_argument("--device", required=True, choices=sorted(DEVICES))
+    add_device_option(vlan_rollback)
     vlan_rollback.add_argument("--host", required=True)
     vlan_rollback.add_argument("--change-id", required=True)
+
+    autowan = commands.add_parser(
+        "autowan",
+        help="Install/enable, disable or inspect automatic LAN-port WAN detection",
+    )
+    add_device_option(autowan)
+    autowan.add_argument("--host", required=True)
+    autowan.add_argument(
+        "--action", choices=["enable", "disable", "status"], default="enable"
+    )
 
     args = parser.parse_args()
     try:
@@ -885,6 +1043,8 @@ def main() -> int:
                 stage_image(args, image)
         elif args.command == "vlans":
             configure_vlans(args)
+        elif args.command == "autowan":
+            manage_autowan(args)
         elif args.command == "vlan-confirm":
             finish_vlan_change(args, "confirm")
         else:

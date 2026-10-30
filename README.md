@@ -63,6 +63,18 @@ Qualcomm/IPQ50xx Xiaomi AX6000 image or the MediaTek non-U-BootMod variant.
 Likewise, Aruba AP-303 and AP-303H are separate profiles. The script checks
 the board identifier before staging an image to help prevent cross-flashing.
 
+**The tool is not limited to these two models, and no model has a special
+role** (any device with an uplink can be a WAN node). `--device` accepts:
+
+- an OpenWrt board name, as shown by `ubus call system board` (`aruba,ap-303`),
+- a Firmware Selector profile id (`aruba_ap-303`), or
+- the shortcuts `redmi-ax6000-ubootmod` and `aruba-ap-303`.
+
+The build target (e.g. `ipq40xx/generic`) is discovered from the Selector; add
+`--target` only if a profile exists for several targets. The board check on the
+device compares names with `,` and `_` treated alike. The flash confirmation
+uses the board name the device itself reports.
+
 PICOT0 was reported as LibreMesh master revision `b88562f`, built on OpenWrt
 25.12.5, with hostname `PICOT0`. The Aruba AP-303 was also reported on the
 same LibreMesh revision, but its `ubus` binary was missing. The deployment
@@ -109,7 +121,9 @@ The requested starting point is:
 | 20 | Guests | `villapicot-GUEST` | `192.168.20.0/24` | WAN access; AP client isolation; main may initiate connections |
 
 VLAN 10 and 20 are carried as batman-adv VLAN devices (`bat0.10` and
-`bat0.20`) across the mesh. DHCP and routing are hosted only on PICOT0. VLAN
+`bat0.20`) across the mesh. DHCP and routing are hosted on the one node whose
+config has `role 'gateway'` (PICOT0 in the examples; any node can hold the
+role, but use **exactly one gateway per mesh**, it is not checked across nodes). VLAN
 clients on configured APs can therefore reach that gateway through intervening
 legacy nodes without requiring those nodes to become VLAN-aware. The existing
 `villapicot` SSID and untagged `br-lan` remain the common network across old
@@ -118,8 +132,8 @@ and new nodes; VLAN 30 is not created or assumed.
 VLANs are added only to radios named in that node's config. All physical
 Ethernet ports and their existing roles are left untouched and remain
 untagged on the current main network. This first implementation does not
-configure Ethernet access ports/trunks, change WAN uplinks, or provide
-multi-WAN failover.
+configure Ethernet access ports/trunks. WAN uplinks are handled separately by
+automatic WAN detection (see below).
 
 Firewall policy on PICOT0: IoT clients may use gateway DHCP/DNS but have no
 WAN forwarding; Guest clients may use gateway DHCP/DNS and forward to WAN;
@@ -177,9 +191,9 @@ python3 deploy-libremesh.py vlans \
 ```
 
 The command requires strict SSH host-key checking and verifies the board
-identifier. Gateway role is additionally restricted on-device to the Redmi
-AX6000 U-BootMod with hostname `PICOT0`. For each other VLAN-enabled AP, make
-an edge config from `vlan-configs/edge.example`, set the proper radios, then
+identifier. The `gateway` role is not tied to a model or hostname: choose the
+node that should serve VLAN DHCP/routing (with an uplink for guest Internet).
+For each other VLAN-enabled AP, make an edge config from `vlan-configs/edge.example`, set the proper radios, then
 use the matching device profile and SSH host.
 Leave `enabled` at `0` on nodes that should continue operating as legacy-only
 nodes. This `vlans` command configures the installed firmware directly; it
@@ -232,11 +246,116 @@ main network before confirming. The change is applied by direct UCI updates;
 it does not invoke `lime-config`, which could regenerate LibreMesh-managed
 network or wireless sections.
 
+### Return a node to normal behaviour (no VLANs)
+
+If VLANs do not work on a node, remove them from just that node:
+
+```sh
+python3 deploy-libremesh.py vlans --device aruba,ap-303 --host root@ARUBA_HOST --disable
+```
+
+This uses the same timed-rollback flow and prints a `VLAN_CHANGE_ID` to
+confirm. It deletes only the `picot_vlan_*` sections (VLAN devices, VLAN
+SSIDs, DHCP/firewall entries) and leaves the main untagged network, mesh and
+Ethernet settings as they were. The node keeps interoperating with VLAN-enabled
+nodes: batman-adv still forwards their tagged VLAN 10/20 frames transparently,
+and the main network is untagged, so mixed VLAN and non-VLAN nodes stay
+connected. Clients of the removed VLAN SSIDs simply lose those SSIDs on that
+node. If an enabling change fails or is not confirmed, the automatic rollback
+returns the node to its previous state, which is non-VLAN if it had none.
+
 For rollout, enable PICOT0 first so it provides DHCP and routing, then enable
 edge APs one at a time. To retire the VLANs, disable edge APs first and PICOT0
 last. A node left with `enabled '0'` keeps only its existing untagged main
 network and continues to interoperate with both legacy nodes and enabled nodes
 on that main network.
+
+## Automatic WAN detection on any LAN port
+
+Goal: plug an Internet-connected cable into **any** Ethernet port of **any**
+node and have it become the WAN uplink. Several nodes may each have an uplink.
+
+### Does the existing Babel configuration work on the Arubas? Yes.
+
+PICOT0's `lime-defaults`/`lime-autogen` enable **both** protocols on every mesh
+interface: batman-adv (VLAN 116, layer-2 bridging into `br-lan`) and Babel
+(VLAN 17, routing; `babeld` has filters that redistribute a default route
+tagged `proto 7`). The Aruba AP-303 gets the same LibreMesh defaults, the same
+firmware package set (including `babeld-auto-gw-mode` and `watchping`) and the
+same Wi-Fi mesh, so it takes part in the same Babel network with no extra
+configuration. Nothing needs to move to batman-adv.
+
+Moving the gateway logic to batman-adv would in fact be wrong here:
+`batman-adv-auto-gw-mode` disables dnsmasq's DHCP on `br-lan` and requests a
+lease through `lan_dhcp`, which clashes with LibreMesh `anygw`, where **every
+node serves DHCP** on the shared `10.100.0.1` gateway address. It is therefore
+deliberately **not** installed. (`bat0` stays in `gw_mode client`.)
+
+### What LibreMesh already does (verified in `libremesh/lime-packages`)
+
+- `lime-hwd-openwrt-wan` / `lime-proto-wan` configure only the board's
+  dedicated `wan` port (from OpenWrt's `board.json`). There is **no LibreMesh
+  feature that turns a LAN port into a WAN port**, and the Aruba AP-303 has no
+  `wan` interface at all.
+- `watchping` (`system.watchping`, interface `wan`) pings through `wan` and
+  runs the hooks in `/etc/watchping/wan-ok.d` and `wan-fail.d`.
+- `babeld-auto-gw-mode` uses those hooks: while `wan` has real Internet it
+  announces a default route (`proto 7`) to the mesh; when it fails it removes
+  it. Any node with a working uplink thus becomes a gateway automatically,
+  nodes route through the best one, and traffic fails over if it disappears.
+  There is no manual master election.
+
+### What `picot-autowan` adds (only the missing LAN-port piece)
+
+A small daemon (`/usr/sbin/picot-autowan`, procd). The promoted port simply
+**becomes the stock `wan` interface**, so all of the above works unchanged and
+`picot-autowan` never touches routing or gateway modes itself:
+
+1. Watches the physical Ethernet ports in `br-lan` for a link-up event. Ports
+   already cabled when the daemon starts are probed only during the first 5
+   minutes after boot, so it never interrupts your admin session.
+2. Only acts if the node has no working uplink: no `wan` interface exists
+   (Aruba) or the physical `wan` port has no cable (Redmi).
+3. Detaches the port from the bridge for a few seconds and requests DHCP. The
+   offer is rejected if malformed or inside the mesh subnet (another mesh node).
+4. Pings public hosts (`1.1.1.1`, `9.9.9.9`) through the port. On success it
+   sets `network.wan.device` to that port (`proto dhcp`), makes sure `wan` is in
+   the firewall `wan` zone, and restarts `watchping`. The original settings are
+   saved and restored on demotion. Otherwise the port goes back to the bridge.
+5. If the promoted port's link stays down for 20 seconds it is returned to the
+   LAN bridge, so a client or mesh cable can be plugged in there later.
+
+```sh
+python3 deploy-libremesh.py autowan --device aruba,ap-303 --host root@ARUBA_HOST
+python3 deploy-libremesh.py autowan --device aruba,ap-303 --host root@ARUBA_HOST --action status
+python3 deploy-libremesh.py autowan --device aruba,ap-303 --host root@ARUBA_HOST --action disable
+```
+
+`disable` stops the daemon and returns the promoted port to the bridge.
+Settings live in `/etc/config/picot-autowan` (`probe_seconds`, `down_seconds`,
+`ping_hosts`, and a space-separated `exclude_ports` to keep a port always LAN;
+e.g. `uci set picot-autowan.settings.exclude_ports='lan1'`). The promoted
+state is also stored there, so it survives a reboot.
+
+Caveats (not yet tested on hardware; pilot on one node with console access):
+
+- A port is detached from the bridge for about 10 seconds when a cable is
+  plugged in. A laptop plugged into a LAN port sees a short blip and then
+  stays on the LAN.
+- LibreMesh's gateway hooks only follow the interface named `wan`, so a node
+  has **one** uplink; redundancy comes from several nodes having uplinks.
+- A promoted port is a plain WAN port: it no longer carries the wired mesh.
+  On an Aruba AP-303 with a single Ethernet port, promoting it removes the
+  wired path to the mesh (it keeps meshing over Wi-Fi).
+- If the physical `wan` port of a Redmi is cabled, no LAN port is promoted.
+  If a LAN port was promoted first and the `wan` cable is plugged in later, it
+  is not used until the promoted port is unplugged.
+- Re-running `lime-config` regenerates `br-lan`; the daemon removes the
+  promoted port from the bridge again when it restarts.
+- A device that offers Internet on a LAN port (including a phone hotspot or a
+  rogue DHCP server) will be treated as an uplink. Use `exclude_ports` for
+  ports that must never become WAN.
+- The mesh subnet check assumes the node's LAN is `network.lan`.
 
 ## Firmware Selector and package selection
 
@@ -348,15 +467,16 @@ Build and stage PICOT0, without flashing:
 
 ```sh
 python3 deploy-libremesh.py deploy \
-  --device redmi-ax6000-ubootmod \
-  --host root@PICOT0
+  --device xiaomi,redmi-router-ax6000-ubootmod \
+  --host root@PICOT0 \
+  --failsafe-dir backup-PICOT0-2026-10-30
 ```
 
-For an Aruba AP-303:
+For an Aruba AP-303 (OpenWrt board name; no failsafe-dir needed):
 
 ```sh
 python3 deploy-libremesh.py deploy \
-  --device aruba-ap-303 \
+  --device aruba,ap-303 \
   --host root@ARUBA_HOST
 ```
 
@@ -371,7 +491,9 @@ files to `/etc/sysupgrade.conf`, verifies the uploaded image hash, and runs
 `sysupgrade -T` (image compatibility test). It does not reboot the AP unless
 `--flash` is explicitly supplied.
 
-On PICOT0, staging additionally installs the dated config backup at:
+With `--failsafe-dir DIR` (any directory holding a known-good `etc/config`,
+e.g. `backup-PICOT0-2026-10-30`), staging additionally installs it, on any
+device model, at:
 
 ```text
 /root/libremesh-failsafe/picot0-config.tar.gz
@@ -383,8 +505,9 @@ On every device, staging saves that device's live configuration at:
 /root/libremesh-failsafe/live-config.tar.gz
 ```
 
-The dated PICOT0 archive is never sent to Aruba devices. Each Aruba gets its
-own live configuration capture instead.
+Without `--failsafe-dir`, only the live capture is saved. Choose the failsafe
+directory deliberately per node: it carries the hostname and addresses of the
+node it was taken from.
 
 ### 4. Flash only after review
 
@@ -395,6 +518,7 @@ starts sysupgrade:
 python3 deploy-libremesh.py deploy \
   --device redmi-ax6000-ubootmod \
   --host root@PICOT0 \
+  --failsafe-dir backup-PICOT0-2026-10-30 \
   --flash
 ```
 
@@ -446,20 +570,19 @@ The restore script is installed on each staged device at:
 /root/libremesh-failsafe/restore-libremesh-config.sh
 ```
 
-### Restore PICOT0's dated backup
+### Restore the saved failsafe backup
 
-Use a local console or SSH into PICOT0, then run:
+Use a local console or SSH, then run (`picot0` is accepted as an alias of `saved`):
 
 ```sh
-/root/libremesh-failsafe/restore-libremesh-config.sh picot0
+/root/libremesh-failsafe/restore-libremesh-config.sh saved
 ```
 
-The script checks that the board is the Redmi AX6000 U-Boot layout and that
-the hostname is `PICOT0`, verifies the archive paths and required files, and
-asks for:
+The script prints the board and hostname, verifies the archive paths and
+required files, and asks for:
 
 ```text
-RESTORE-PICOT0
+RESTORE-SAVED
 ```
 
 It will refuse to continue unless that exact token is entered.
@@ -490,8 +613,9 @@ network, Wi-Fi, firewall, and dnsmasq services.
 - It is useful only if the device boots and you can reach a shell. If the
   AP is unbootable or unreachable, use the device's supported recovery
   procedure or local/serial access.
-- The `picot0` restore is intentionally restricted to PICOT0. Do not remove
-  that check to force the backup onto another model or node.
+- The `saved` restore applies the staged backup as-is to whatever node it was
+  staged on, including that backup's hostname and addresses. Only stage a
+  backup on a node it is appropriate for.
 - A configuration restore can disconnect the session or change the device's
   management address. Have local access available.
 
@@ -560,6 +684,31 @@ Try the local Ethernet management address and wait for mesh convergence. If
 the device does not boot or cannot be reached, use local/serial recovery. The
 configuration restore command is not a substitute for firmware recovery.
 
+## Emulator testbed (experimental)
+
+`emulator/lime_testbed.py` is an unprivileged QEMU/KVM harness (no root, no
+TAP devices) intended to test the scripts on several virtual nodes:
+
+- each node is an x86-64 OpenWrt/LibreMesh VM; links between nodes are
+  Ethernet segments switched by a small userspace hub, and a link can be cut
+  and restored at runtime to simulate failover;
+- every VM can get a management NIC with an SSH port forwarded on
+  `127.0.0.1`; `Testbed.setup_ssh()` writes an ssh config that
+  `deploy-libremesh.py` uses when `LIBREMESH_SSH_CONFIG=<file>` is set
+  (strict host-key checking and BatchMode stay on);
+- the serial console is driven directly, so no extra Python packages are
+  needed. `emulator/images/` and `emulator/state/` are git-ignored.
+
+Status: the harness boots three VMs on a chain topology (A-B-C). The LibreMesh
+image build for x86/64 (`deploy-libremesh.py build --device generic --target
+x86/64`) and the mesh, VLAN and autowan scenarios have NOT been run yet.
+Note that stock x86 images bridge `eth0` into `br-lan`, so ports must be
+detached before addressing them by hand.
+
+Limits: there is no QEMU machine for the Aruba's IPQ40xx SoC, so the emulator
+cannot reproduce ath10k/mt7915 radios, real Wi-Fi mesh, DSA/switch port
+naming or Aruba hardware quirks. It checks logic and scripts only.
+
 ## Design and change log
 
 - Existing client SSID and mesh ID were read from PICOT0's live configuration
@@ -569,6 +718,7 @@ configuration restore command is not a substitute for firmware recovery.
   point.
 - VLAN 10/20 support is implemented as an optional per-node operation, but has
   not been applied or tested on live hardware. VLAN 30, Ethernet port
-  assignment/tagging, and multi-WAN failover remain future work.
+  assignment/tagging remain future work. Automatic WAN detection
+  (`picot-autowan`) is likewise implemented but untested on hardware.
 - The VLAN transport and generated device/radio names must be verified on a
   pilot device before fleet rollout. Keep a local recovery path available.

@@ -21,3 +21,6 @@
 
 __pycache__/
 *.py[cod]
+emulator/images/
+emulator/state/
+emulator/__pycache__/

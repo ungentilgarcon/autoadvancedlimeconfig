@@ -82,18 +82,6 @@ validate_config() {
     ip link show bat0 >/dev/null 2>&1 ||
         fail "bat0 is not present; check mesh state before applying"
 
-    if [ "$role" = gateway ]; then
-        [ "$(hostname)" = PICOT0 ] ||
-            fail "gateway role is restricted to hostname PICOT0"
-        board=$(ubus call system board 2>/dev/null |
-            jsonfilter -e '@.board_name' 2>/dev/null || true)
-        [ -n "$board" ] || board=$(cat /tmp/sysinfo/board_name 2>/dev/null || true)
-        [ "$board" = xiaomi,redmi-router-ax6000-ubootmod ] ||
-            fail "gateway role is restricted to the Redmi AX6000 U-BootMod"
-    elif [ "$(hostname)" = PICOT0 ]; then
-        fail "PICOT0 must use the gateway role"
-    fi
-
     for network in iot guest; do
         ssid=$(config_value "$config_dir" "${network}_ssid")
         [ -n "$ssid" ] || fail "${network}_ssid must not be empty"
