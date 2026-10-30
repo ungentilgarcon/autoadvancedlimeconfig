@@ -1,0 +1,6 @@
+config vlan 'settings'
+	option enabled '0'
+	option role 'gateway'
+	option radios 'radio0 radio1'
+	option iot_ssid 'villapicot-IOT'
+	option guest_ssid 'villapicot-GUEST'

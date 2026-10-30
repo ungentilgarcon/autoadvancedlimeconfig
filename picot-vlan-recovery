@@ -1,0 +1,14 @@
+#!/bin/sh /etc/rc.common
+
+START=12
+
+start() {
+    base=/root/libremesh-failsafe
+    pending=$base/vlan-pending
+    script=$base/apply-libremesh-vlans.sh
+
+    [ -s "$pending" ] || return 0
+    transaction=$(cat "$pending")
+    echo "Pending VLAN change found; restoring the previous network configuration."
+    "$script" rollback-boot "$transaction"
+}

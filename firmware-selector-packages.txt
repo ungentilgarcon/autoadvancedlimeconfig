@@ -1,0 +1,5 @@
+# Extra OpenWrt packages listed in script_config_lime_AP.txt.
+# Add one package per line; deploy-libremesh.py also accepts --extra-packages.
+wpad-mesh-openssl
+luci
+nano-full

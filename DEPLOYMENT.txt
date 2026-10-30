@@ -1,0 +1,70 @@
+LibreMesh firmware deployment
+==============================
+
+See README.md for the full configuration snapshot, optional VLAN design,
+deployment examples, security notes, and failsafe/restore details.
+
+Optional VLAN configurations can be validated or applied per device with the
+`vlans` subcommand. Applying starts a 180-second automatic rollback timer;
+confirm the returned change ID with `vlan-confirm` only after verifying
+connectivity. See README.md for configuration templates and policy details.
+VLAN Wi-Fi keys are read from the ignored, mode-600 `.pass` file; initialize it
+from `.pass.example` if needed. Never commit or print `.pass`.
+
+deploy-libremesh.py retrieves the current stable OpenWrt version and profile
+from the Firmware Selector's configured upstream, then requests a custom
+LibreMesh image from the Selector's ASU build service. It verifies the
+downloaded sysupgrade image against the ASU SHA-256 before staging it.
+
+Supported explicit profiles:
+
+  redmi-ax6000-ubootmod
+  aruba-ap-303
+
+The package list in firmware-selector-packages.txt was reconstructed from the
+existing note in script_config_lime_AP.txt: wpad-mesh-openssl, luci, nano-full.
+Add other packages there, or pass --extra-packages "pkg-one pkg-two".
+The list is sent as OpenWrt packages; LibreMesh's current default flavor and
+the profile's device packages are taken from the live Selector configuration.
+
+Build only:
+
+  python3 deploy-libremesh.py build --device redmi-ax6000-ubootmod
+  python3 deploy-libremesh.py build --device aruba-ap-303 \
+    --extra-packages "mwan3 luci-app-mwan3"
+
+Build and stage on the existing PICOT0 without flashing:
+
+  python3 deploy-libremesh.py deploy \
+    --device redmi-ax6000-ubootmod --host root@PICOT0
+
+For an Aruba AP-303, use its SSH host and the aruba-ap-303 profile. Staging
+captures that AP's own current /etc/config as its live rollback. The saved
+PICOT0 config is never copied to Aruba devices.
+
+Only add --flash after reviewing the image and staged rollback. Flashing
+requires typing the exact board confirmation. The upgrade uses sysupgrade -c
+to preserve the current device configuration. SSH host-key checking remains
+enabled; accept/verify each AP's host key before deployment.
+
+On PICOT0, the saved config directory backup-PICOT0-2026-10-30 is archived
+locally and staged at /root/libremesh-failsafe/picot0-config.tar.gz.
+The deployment also captures the pre-upgrade live config on every device.
+To restore, log into the device (use local/serial access if SSH is unavailable)
+and run:
+
+  /root/libremesh-failsafe/restore-libremesh-config.sh picot0
+
+The saved PICOT0 restore is restricted to the Redmi AX6000 U-BootMod whose
+hostname is PICOT0. On an Aruba, restore its captured pre-upgrade config:
+
+  /root/libremesh-failsafe/restore-libremesh-config.sh live
+
+The restore prompts for a confirmation token, saves the current config first,
+then restores UCI files and restarts LibreMesh/network services.
+
+Firmware deployment deliberately preserves the existing network configuration;
+the separate optional VLAN command adds VLAN 10/20 on selected Wi-Fi radios
+with a timed rollback. It leaves Ethernet ports and the existing untagged main
+network unchanged. VLAN 30, Ethernet port tagging, and WAN failover are not
+implemented. Do not pass an unreviewed UCI-defaults script with --uci-defaults.
