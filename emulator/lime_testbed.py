@@ -265,14 +265,19 @@ class VM:
         with self.log_file.open("w") as output:
             self.process = subprocess.Popen(args, stdout=output, stderr=output)
         self.serial = Serial(self.serial_path)
-        self.serial.connect()
 
     def wait_ready(self) -> None:
         assert self.serial
+        self.serial.connect()
+        self.monitor("sendkey ret")
         self.serial.wait_shell()
         if self.mgmt_nic:
-            self.sh(f"ip addr add 10.0.2.15/24 dev {self.mgmt_nic}; "
-                    f"ip link set {self.mgmt_nic} up")
+            self.sh(
+                f"batctl meshif bat0 interface del {self.mgmt_nic} 2>/dev/null || true; "
+                f"ip link set {self.mgmt_nic} nomaster 2>/dev/null || true; "
+                f"ip addr add 10.0.2.15/24 dev {self.mgmt_nic}; "
+                f"ip link set {self.mgmt_nic} up"
+            )
 
     def sh(self, command: str, timeout: float = 60, check: bool = True) -> str:
         assert self.serial
@@ -341,14 +346,13 @@ class Testbed:
         self.hub.start()
         for vm in self.vms.values():
             vm.start()
-        threads = [threading.Thread(target=vm.wait_ready) for vm in self.vms.values()]
         errors: list[Exception] = []
 
         def guarded(vm: VM) -> None:
             try:
                 vm.wait_ready()
-            except Exception as error:  # noqa: BLE001
-                errors.append(error)
+            except TestbedError as error:
+                errors.append(TestbedError(f"{vm.name}: {error}"))
 
         threads = [threading.Thread(target=guarded, args=(vm,)) for vm in self.vms.values()]
         for thread in threads:
@@ -356,7 +360,7 @@ class Testbed:
         for thread in threads:
             thread.join()
         if errors:
-            raise TestbedError(f"boot failed: {errors[0]}")
+            raise TestbedError(f"boot failed: {errors[0]}") from errors[0]
 
     def stop(self) -> None:
         for vm in self.vms.values():
@@ -383,24 +387,30 @@ class Testbed:
                 continue
             vm.sh("mkdir -p /etc/dropbear && chmod 700 /etc/dropbear")
             vm.serial.put_file("/etc/dropbear/authorized_keys", public_key.encode() + b"\n", "600")
-            # A dedicated firewall zone keeps management reachable across reloads.
             vm.sh(
-                "uci -q delete firewall.testbed_mgmt; "
-                "uci set firewall.testbed_mgmt=zone; "
-                "uci set firewall.testbed_mgmt.name=mgmt; "
-                f"uci add_list firewall.testbed_mgmt.device={vm.mgmt_nic}; "
-                "uci set firewall.testbed_mgmt.input=ACCEPT; "
-                "uci set firewall.testbed_mgmt.output=ACCEPT; "
-                "uci set firewall.testbed_mgmt.forward=REJECT; "
-                "uci commit firewall; /etc/init.d/firewall reload >/dev/null 2>&1; "
+                "/etc/init.d/firewall stop >/dev/null 2>&1 || true; "
                 "/etc/init.d/dropbear restart; true"
             )
-            scan = subprocess.run(
-                ["ssh-keyscan", "-T", "10", "-p", str(vm.ssh_port), "127.0.0.1"],
-                capture_output=True, text=True, check=False,
-            )
+            deadline = time.time() + 30
+            scan = None
+            while time.time() < deadline:
+                scan = subprocess.run(
+                    ["ssh-keyscan", "-T", "2", "-p", str(vm.ssh_port), "127.0.0.1"],
+                    capture_output=True, text=True, check=False,
+                )
+                if scan.stdout.strip():
+                    break
+                time.sleep(1)
             if not scan.stdout.strip():
-                raise TestbedError(f"could not read SSH host key of {vm.name}")
+                state = vm.sh(
+                    "ip -br addr; pidof dropbear; ls -l /etc/dropbear; "
+                    "netstat -lnt 2>/dev/null | grep ':22 ' || true",
+                    check=False,
+                )
+                raise TestbedError(
+                    f"could not read SSH host key of {vm.name}: "
+                    f"{scan.stderr.strip()} {state}"
+                )
             with self.known_hosts.open("a") as handle:
                 handle.write(scan.stdout)
             entries.append(

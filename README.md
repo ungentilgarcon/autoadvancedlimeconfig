@@ -699,11 +699,18 @@ TAP devices) intended to test the scripts on several virtual nodes:
 - the serial console is driven directly, so no extra Python packages are
   needed. `emulator/images/` and `emulator/state/` are git-ignored.
 
-Status: the harness boots three VMs on a chain topology (A-B-C). The LibreMesh
-image build for x86/64 (`deploy-libremesh.py build --device generic --target
-x86/64`) and the mesh, VLAN and autowan scenarios have NOT been run yet.
-Note that stock x86 images bridge `eth0` into `br-lan`, so ports must be
-detached before addressing them by hand.
+Status (2026-11-01): a Firmware Selector x86/64 LibreMesh image was built and
+verified. Three-node tests passed for bidirectional pings, batman-adv
+neighbours, Babel daemon startup, and continued A-to-C connectivity after
+cutting the direct A-C link. A separate stock OpenWrt test also verified that
+cutting a link stops traffic on that segment. The Babel test checks that the
+daemon is running; it does not verify Babel-learned routes. VLAN apply,
+rollback, autowan, and real-hardware tests are still outstanding. See the
+[test journal](./emulator/TEST-JOURNAL.md) for exact results.
+
+The harness detaches management/mesh ports before assigning test addresses.
+Stock x86 images may bridge Ethernet ports into `br-lan`; do not assume port
+roles from their names.
 
 Limits: there is no QEMU machine for the Aruba's IPQ40xx SoC, so the emulator
 cannot reproduce ath10k/mt7915 radios, real Wi-Fi mesh, DSA/switch port

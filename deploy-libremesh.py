@@ -422,10 +422,15 @@ def build_image(args: argparse.Namespace) -> Path | None:
         raise DeployError(f"ASU build failed (HTTP {status}): {str(detail)[:2500]}")
 
     images = response.get("images", [])
-    candidates = [image for image in images if image.get("type") == "sysupgrade"]
+    image_type = getattr(args, "image_type", "sysupgrade")
+    candidates = [image for image in images if image.get("type") == image_type]
+    if image_type != "sysupgrade" and len(candidates) > 1:
+        candidates = [i for i in candidates if "squashfs" in i.get("name", "")] or candidates
     if len(candidates) != 1:
+        offered = ", ".join(f"{i.get('type')}:{i.get('name')}" for i in images)
         raise DeployError(
-            f"ASU returned {len(candidates)} sysupgrade images; expected exactly one"
+            f"ASU returned {len(candidates)} '{image_type}' images; expected exactly one. "
+            f"Offered: {offered}"
         )
     image = candidates[0]
     image_name = image.get("name", "")
@@ -928,6 +933,12 @@ def add_build_options(parser: argparse.ArgumentParser) -> None:
         help="OpenWrt version, or 'latest' for the Selector's current stable release",
     )
     parser.add_argument("--feed-branch", default="master", help="LibreMesh feed branch")
+    parser.add_argument(
+        "--image-type",
+        default="sysupgrade",
+        help="ASU image type to download (default sysupgrade; x86 emulator "
+        "builds use 'combined')",
+    )
     parser.add_argument(
         "--output-dir",
         type=Path,
