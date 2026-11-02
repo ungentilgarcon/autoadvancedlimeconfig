@@ -1,5 +1,20 @@
 # Emulator test journal
 
+## 2026-11-02
+
+### VXLAN feasibility
+
+- Added the OpenWrt `vxlan` protocol package to the default firmware package
+  list; it depends on the kernel-matched `kmod-vxlan`.
+- An x86/64 image containing `kmod-vxlan` loaded the kernel module. Installing
+  the separate `vxlan` protocol package in an ephemeral VM allowed netifd to
+  create an up VXLAN interface with MTU 1450 after a network restart.
+- The full build with the `vxlan` protocol package exceeded the 150-second ASU
+  build limit. The earlier image had only the kernel module.
+- End-to-end DHCP and mesh transport over VXLAN are **not verified**. Mesh
+  reachability did not come up reliably in the attempted test run; do not use
+  the current VLAN script on live nodes.
+
 ## 2026-11-01
 
 ### Image
@@ -25,7 +40,7 @@
   management NIC also had to be removed from LibreMesh's mesh/bridge before
   its forwarded SSH connection worked. One-node SSH setup then passed.
 
-### Not yet tested
+### Not yet tested (as of 2026-11-01)
 
 - VLAN apply/confirm/disable and timed rollback. A VLAN run was started but
   did not return a result.

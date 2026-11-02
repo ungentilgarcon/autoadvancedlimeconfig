@@ -16,12 +16,12 @@ sysupgrade of the real firmware cannot be reproduced.
 """
 from __future__ import annotations
 
-import base64
 import gzip
 import os
 import re
 import secrets
 import select
+import shlex
 import shutil
 import socket
 import subprocess
@@ -187,12 +187,20 @@ class Serial:
         raise TestbedError("console never became usable")
 
     def put_file(self, remote_path: str, content: bytes, mode: str = "644") -> None:
-        self.run(f": > {remote_path}", timeout=15)
-        encoded = base64.b64encode(content).decode()
-        for index in range(0, len(encoded), 400):
-            chunk = encoded[index:index + 400]
-            self.run(f"printf %s '{chunk}' | base64 -d >> {remote_path}", timeout=15)
-        self.run(f"chmod {mode} {remote_path}", timeout=15)
+        quoted_path = shlex.quote(remote_path)
+        status, output = self.run(f": > {quoted_path}", timeout=15)
+        if status:
+            raise TestbedError(f"could not create {remote_path}: {output}")
+        for index in range(0, len(content), 96):
+            chunk = "".join(f"\\{byte:03o}" for byte in content[index:index + 96])
+            status, output = self.run(
+                f"printf '{chunk}' >> {quoted_path}", timeout=15
+            )
+            if status:
+                raise TestbedError(f"could not write {remote_path}: {output}")
+        status, output = self.run(f"chmod {mode} {quoted_path}", timeout=15)
+        if status:
+            raise TestbedError(f"could not chmod {remote_path}: {output}")
 
 
 class VM:
@@ -269,8 +277,15 @@ class VM:
     def wait_ready(self) -> None:
         assert self.serial
         self.serial.connect()
-        self.monitor("sendkey ret")
-        self.serial.wait_shell()
+        for attempt in range(6):
+            self.monitor("sendkey ret")
+            try:
+                self.serial.wait_shell(timeout=12)
+                break
+            except TestbedError:
+                if attempt == 5:
+                    raise
+                log(f"{self.name}: console not ready; retrying GRUB Enter")
         if self.mgmt_nic:
             self.sh(
                 f"batctl meshif bat0 interface del {self.mgmt_nic} 2>/dev/null || true; "

@@ -120,14 +120,14 @@ The requested starting point is:
 | 10 | IoT devices | `villapicot-IOT` | `192.168.10.0/24` | No WAN forwarding; main may initiate management connections |
 | 20 | Guests | `villapicot-GUEST` | `192.168.20.0/24` | WAN access; AP client isolation; main may initiate connections |
 
-VLAN 10 and 20 are carried as batman-adv VLAN devices (`bat0.10` and
-`bat0.20`) across the mesh. DHCP and routing are hosted on the one node whose
-config has `role 'gateway'` (PICOT0 in the examples; any node can hold the
-role, but use **exactly one gateway per mesh**, it is not checked across nodes). VLAN
-clients on configured APs can therefore reach that gateway through intervening
-legacy nodes without requiring those nodes to become VLAN-aware. The existing
-`villapicot` SSID and untagged `br-lan` remain the common network across old
-and new nodes; VLAN 30 is not created or assumed.
+The current VLAN script carries VLAN 10 and 20 as batman-adv VLAN devices
+(`bat0.10` and `bat0.20`). QEMU testing showed that DHCP and ARP-based
+reachability fail with bridge-loop avoidance enabled, so **do not enable VLANs
+on live nodes yet**. VXLAN over mesh IP is being evaluated as a replacement;
+its end-to-end transport and DHCP behavior are not verified. The intended
+gateway remains the one node whose config has `role 'gateway'`, but peer
+configuration for a replacement transport is not implemented. VLAN 30 is not
+created or assumed.
 
 VLANs are added only to radios named in that node's config. All physical
 Ethernet ports and their existing roles are left untouched and remain

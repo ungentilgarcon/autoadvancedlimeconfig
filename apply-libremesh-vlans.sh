@@ -114,7 +114,8 @@ restore_transaction() {
     [ -f "$BASE/vlan-$transaction/had-picot-vlan" ] ||
         rm -f /etc/config/picot-vlan
     if [ -f "$BASE/vlan-$transaction/had-equipment-pass" ]; then
-        install -m 600 "$BASE/vlan-$transaction/previous.pass" "$PASS_FILE"
+        cp "$BASE/vlan-$transaction/previous.pass" "$PASS_FILE"
+        chmod 600 "$PASS_FILE"
     else
         rm -f "$PASS_FILE"
     fi
@@ -266,8 +267,8 @@ configure_network() {
 
 start_watchdog() {
     transaction=$1
-    command -v nohup >/dev/null 2>&1 || fail "nohup is required for timed rollback"
-    nohup sh -c '
+    sh -c '
+        trap "" HUP
         sleep "$1"
         [ -s "$2" ] || exit 0
         [ "$(cat "$2")" = "$3" ] || exit 0
@@ -291,7 +292,8 @@ apply_config() {
 
     temp_dir=$(mktemp -d)
     trap 'rm -rf "$temp_dir"' EXIT HUP INT TERM
-    install -m 600 "$source_config" "$temp_dir/picot-vlan"
+    cp "$source_config" "$temp_dir/picot-vlan"
+    chmod 600 "$temp_dir/picot-vlan"
     validate_config "$temp_dir"
     enabled=$(config_value "$temp_dir" enabled)
     if [ "$enabled" = 1 ]; then
@@ -323,8 +325,10 @@ apply_config() {
 
     start_watchdog "$transaction"
     apply_started=1
-    install -m 600 "$temp_dir/picot-vlan" /etc/config/picot-vlan
-    install -m 600 "$source_pass" "$PASS_FILE"
+    cp "$temp_dir/picot-vlan" /etc/config/picot-vlan
+    chmod 600 /etc/config/picot-vlan
+    cp "$source_pass" "$PASS_FILE"
+    chmod 600 "$PASS_FILE"
     for path in /root/libremesh-failsafe/apply-libremesh-vlans.sh \
         /root/libremesh-failsafe/equipment.pass /etc/config/picot-vlan \
         /etc/init.d/picot-vlan-recovery; do
@@ -395,7 +399,8 @@ case "${1:-}" in
         [ "$#" -eq 3 ] || fail "Usage: $0 validate CONFIG PASS_FILE"
         temp_dir=$(mktemp -d)
         trap 'rm -rf "$temp_dir"' EXIT HUP INT TERM
-        install -m 600 "$2" "$temp_dir/picot-vlan"
+        cp "$2" "$temp_dir/picot-vlan"
+        chmod 600 "$temp_dir/picot-vlan"
         validate_config "$temp_dir"
         if [ "$(config_value "$temp_dir" enabled)" = 1 ]; then
             validate_pass_file "$3"

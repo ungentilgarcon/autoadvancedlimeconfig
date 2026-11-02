@@ -11,12 +11,13 @@ RUN=/var/run/picot-autowan
 # from an untrusted peer, so only store them; they are validated by the caller.
 case "${1:-}" in
     bound|renew)
-        [ -n "${LEASE_FILE:-}" ] || exit 0
+        lease_file=${LEASE_FILE:-"$RUN/lease.${interface:-unknown}"}
+        mkdir -p "$RUN"
         {
             echo "ip=$ip"
             echo "mask=$subnet"
             echo "router=${router%% *}"
-        } > "$LEASE_FILE"
+        } > "$lease_file"
         exit 0
         ;;
     deconfig|leasefail|nak) exit 0 ;;
@@ -120,7 +121,8 @@ reload_services() {
 # Detached ports are always reattached on failure.
 probe_port() {
     port=$1
-    lease=$(mktemp)
+    lease="$RUN/lease.$port"
+    rm -f "$lease"
     secs=$(opt probe_seconds 4)
     hosts=$(opt ping_hosts "1.1.1.1 9.9.9.9")
 
@@ -156,7 +158,7 @@ probe_port() {
             ip addr flush dev "$port" 2>/dev/null || true
         fi
     else
-        log "$port: no valid DHCP lease, treating as LAN"
+        log "$port: no valid DHCP lease (ip=${lease_ip:-missing}, mask=${lease_mask:-missing}, router=${lease_router:-missing}), treating as LAN"
     fi
 
     if [ "$ok" != 1 ]; then

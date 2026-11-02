@@ -60,7 +60,7 @@ def _ssh_command(program: str) -> list[str]:
 
 
 SSH_CMD = _ssh_command("ssh")
-SCP_CMD = _ssh_command("scp")
+SCP_CMD = [*_ssh_command("scp"), "-O"]
 
 
 def normalize_board(name: str) -> str:
@@ -702,7 +702,8 @@ def _configure_vlans(
             f"mkdir -p {remote_dir}; "
             f"chmod 600 {remote_config}; "
             f"chmod 600 {remote_pass}; "
-            f"install -m 700 /tmp/apply-libremesh-vlans.sh {remote_script}; "
+            f"cp /tmp/apply-libremesh-vlans.sh {remote_script}; "
+            f"chmod 700 {remote_script}; "
             "rm -f /tmp/apply-libremesh-vlans.sh; "
             f"{remote_script} validate {remote_config} {remote_pass}",
         )
@@ -720,8 +721,8 @@ def _configure_vlans(
         ssh(
             args.host,
             "set -eu; "
-            "install -m 755 /tmp/picot-vlan-recovery "
-            "/etc/init.d/picot-vlan-recovery; "
+            "cp /tmp/picot-vlan-recovery /etc/init.d/picot-vlan-recovery; "
+            "chmod 755 /etc/init.d/picot-vlan-recovery; "
             "rm -f /tmp/picot-vlan-recovery; "
             "/etc/init.d/picot-vlan-recovery enable",
         )
@@ -766,8 +767,10 @@ def manage_autowan(args: argparse.Namespace) -> None:
     ssh(
         args.host,
         "set -eu; "
-        "install -m 755 /tmp/picot-autowan /usr/sbin/picot-autowan; "
-        "install -m 755 /tmp/picot-autowan.init /etc/init.d/picot-autowan; "
+        "cp /tmp/picot-autowan /usr/sbin/picot-autowan; "
+        "chmod 755 /usr/sbin/picot-autowan; "
+        "cp /tmp/picot-autowan.init /etc/init.d/picot-autowan; "
+        "chmod 755 /etc/init.d/picot-autowan; "
         "rm -f /tmp/picot-autowan /tmp/picot-autowan.init; "
         "/usr/sbin/picot-autowan check; "
         "/usr/sbin/picot-autowan configure enable; "
@@ -831,12 +834,14 @@ def stage_image(args: argparse.Namespace, image_path: Path) -> None:
             "set -eu; "
             f"mkdir -p {remote_dir}; "
             "tar -czf /root/libremesh-failsafe/live-config.tar.gz -C / etc/config; "
-            "install -m 700 /tmp/restore-libremesh-config.sh "
+            "cp /tmp/restore-libremesh-config.sh "
             f"{remote_dir}/restore-libremesh-config.sh; "
+            f"chmod 700 {remote_dir}/restore-libremesh-config.sh; "
             "rm -f /tmp/restore-libremesh-config.sh; "
             + (
-                "install -m 600 /tmp/picot0-config.tar.gz "
+                "cp /tmp/picot0-config.tar.gz "
                 f"{remote_dir}/picot0-config.tar.gz; "
+                f"chmod 600 {remote_dir}/picot0-config.tar.gz; "
                 "rm -f /tmp/picot0-config.tar.gz; "
                 if backup_path
                 else ""

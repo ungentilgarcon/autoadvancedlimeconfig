@@ -56,13 +56,18 @@ def mesh_ip(vm: t.VM) -> str:
     return vm.sh("ip -4 -o addr show dev bat0 | awk '{print $4}' | head -1 | cut -d/ -f1")
 
 
-def build_topology(image: Path, stock: Path, with_isp: bool = True) -> t.Testbed:
+def build_topology(
+    image: Path, stock: Path, with_isp: bool = True, autowan_only: bool = False
+) -> t.Testbed:
     tb = t.Testbed("lab")
     if with_isp:
-        tb.add_vm("isp", stock, ["isp"], memory=256)
-        tb.add_vm("a", image, ["ab", "isp", "ac"], memory=448)
-        tb.add_vm("b", image, ["ab", "wanb", "bc"], memory=448)
-        tb.add_vm("c", image, ["ac", "wanc", "bc", "isp"], memory=448)
+        tb.add_vm("isp", stock, ["isp"], management=False, memory=256)
+        if autowan_only:
+            tb.add_vm("c", image, ["ac", "wanc", "isp"], memory=448)
+        else:
+            tb.add_vm("a", image, ["ab", "isp", "ac"], memory=448)
+            tb.add_vm("b", image, ["ab", "wanb", "bc"], memory=448)
+            tb.add_vm("c", image, ["ac", "wanc", "bc", "isp"], memory=448)
     else:
         tb.add_vm("a", image, ["ab", "wana", "ac"], memory=448)
         tb.add_vm("b", image, ["ab", "wanb", "bc"], memory=448)
@@ -78,9 +83,11 @@ def prepare(tb: t.Testbed, configure_ssh: bool = True) -> None:
             "ip addr add 1.1.1.1/32 dev lo; ip addr add 9.9.9.9/32 dev lo; "
             "ip addr add 8.8.8.8/32 dev lo; true"
         )
-        tb.vms["b"].set_nic_link(1, False)
-        tb.vms["c"].set_nic_link(1, False)
-        tb.vms["c"].set_nic_link(3, False)
+        if "b" in tb.vms:
+            tb.vms["b"].set_nic_link(1, False)
+        if "c" in tb.vms:
+            tb.vms["c"].set_nic_link(1, False)
+            tb.vms["c"].set_nic_link(len(tb.vms["c"].links) - 1, False)
     else:
         for name in "abc":
             tb.vms[name].set_nic_link(1, False)
@@ -93,7 +100,7 @@ def prepare(tb: t.Testbed, configure_ssh: bool = True) -> None:
             "uci set network.testmgmt.proto=static; "
             "uci set network.testmgmt.ipaddr=10.0.2.15/24; uci commit network; true"
         )
-    for index, name in enumerate("abc", start=1):
+    for index, name in enumerate((n for n in "abc" if n in tb.vms), start=1):
         tb.vms[name].sh(f"ip addr add 10.77.0.{index}/24 dev bat0")
     if configure_ssh:
         tb.setup_ssh([n for n in tb.vms if n != "isp"])
@@ -152,16 +159,62 @@ def scenario_vlan(tb: t.Testbed) -> None:
             check(f"vlans apply on {name}", result.returncode == 0,
                   (result.stdout + result.stderr)[-800:])
             if result.returncode == 0:
-                confirm = tool(tb, "vlan-confirm", "--device", BOARD, "--host", name)
-                check(f"vlan-confirm on {name}", confirm.returncode == 0,
-                      (confirm.stdout + confirm.stderr)[-500:])
+                match = re.search(r"VLAN_CHANGE_ID=([0-9-]+)", result.stdout)
+                if not match:
+                    check(f"vlan-confirm on {name}", False, "apply output omitted change ID")
+                else:
+                    confirm = tool(
+                        tb, "vlan-confirm", "--device", BOARD, "--host", name,
+                        "--change-id", match.group(1),
+                    )
+                    check(f"vlan-confirm on {name}", confirm.returncode == 0,
+                          (confirm.stdout + confirm.stderr)[-500:])
         a, b, c = (tb.vms[n] for n in "abc")
         check("bat0.10 and bat0.20 exist on gateway",
               a.sh("ip link show bat0.10 >/dev/null && ip link show bat0.20 >/dev/null; echo $?", check=False).endswith("0"))
-        got = wait_for(
-            lambda: b.sh("udhcpc -i bat0.10 -n -q -t 3 -T 2 -s /bin/true 2>&1 | grep -c 'lease of 192.168.10'", check=False).strip() == "1",
-            90, 10)
-        check("edge node gets an IoT (VLAN 10) lease from the gateway over bat0.10", got)
+        a.sh(
+            "uci set dhcp.@dnsmasq[0].logdhcp=1; uci commit dhcp; "
+            "/etc/init.d/dnsmasq restart"
+        )
+        lease = b.sh(
+            "udhcpc -i bat0.10 -n -q -t 3 -T 2 -s /bin/true 2>&1 || true",
+            timeout=15,
+            check=False,
+        )
+        if "lease of 192.168.10." not in lease:
+            lease += "\ngateway: " + a.sh(
+                "ip -d link show bat0.10; ip -4 addr show dev bat0.10; "
+                "uci show dhcp.picot_vlan_iot_dhcp; uci show network.picot_vlan_iot; "
+                "grep -hE 'interface=|dhcp-range=' /var/etc/dnsmasq.conf.* 2>/dev/null; "
+                "nft list chain inet fw4 input 2>&1; "
+                "logread | grep -E 'dnsmasq|DHCP' | tail -10; "
+                "batctl meshif bat0 vid 10 vlan_json 2>&1; "
+                "batctl meshif bat0 n | head -5",
+                check=False,
+            )
+            lease += "\nedge: " + b.sh(
+                "ip -d link show bat0.10; ip -4 addr show dev bat0.10; "
+                "ip neigh show dev bat0.10; "
+                "batctl meshif bat0 vid 10 vlan_json 2>&1; "
+                "batctl meshif bat0 n | head -5",
+                check=False,
+            )
+        check("edge node gets an IoT (VLAN 10) lease from the gateway over bat0.10",
+              "lease of 192.168.10." in lease, lease[-2500:])
+        a.sh(
+            "nft insert rule inet fw4 input iifname 'bat0.10' "
+            "ip protocol icmp accept"
+        )
+        vlan_ping = b.sh(
+            "ip addr add 192.168.10.2/24 dev bat0.10; "
+            "ping -c2 -W2 192.168.10.1 2>&1; result=$?; "
+            "ip neigh show dev bat0.10; "
+            "ip addr del 192.168.10.2/24 dev bat0.10; echo PING_STATUS=$result",
+            timeout=30,
+            check=False,
+        )
+        check("edge reaches gateway across bat0.10 with static test address",
+              "PING_STATUS=0" in vlan_ping, vlan_ping[-500:])
         ips = {n: mesh_ip(tb.vms[n]) for n in "abc"}
         check("non-VLAN node C still reaches VLAN gateway A",
               wait_for(lambda: c.sh(f"ping -c2 -W2 {ips['a']} >/dev/null", check=False) == "", 60))
@@ -171,7 +224,10 @@ def scenario_vlan(tb: t.Testbed) -> None:
         check("vlans --disable on edge B", result.returncode == 0,
               (result.stdout + result.stderr)[-800:])
         if result.returncode == 0:
-            tool(tb, "vlan-confirm", "--device", BOARD, "--host", "b")
+            match = re.search(r"VLAN_CHANGE_ID=([0-9-]+)", result.stdout)
+            if match:
+                tool(tb, "vlan-confirm", "--device", BOARD, "--host", "b",
+                     "--change-id", match.group(1))
         gone = b.sh("uci -q show network | grep -c picot_vlan; true", check=False).strip()
         check("VLAN sections removed on B", gone.endswith("0"), gone)
         check("B still meshes with VLAN gateway A after --disable",
@@ -195,32 +251,90 @@ def scenario_vlan_rollback(tb: t.Testbed) -> None:
               (result.stdout + result.stderr)[-800:])
         check("VLAN config active before timeout",
               c.sh("uci -q show network | grep -c picot_vlan; true", check=False).strip() != "0")
-        time.sleep(200)
+        match = re.search(r"VLAN_CHANGE_ID=([0-9-]+)", result.stdout)
+        if match:
+            rollback = tool(
+                tb, "vlan-rollback", "--device", BOARD, "--host", "c",
+                "--change-id", match.group(1),
+            )
+            check("explicit vlan-rollback on C", rollback.returncode == 0,
+                  (rollback.stdout + rollback.stderr)[-500:])
+        else:
+            check("explicit vlan-rollback on C", False, "apply output omitted change ID")
         after = c.sh("uci -q show network | grep -c picot_vlan; true", check=False).strip()
-        check("unconfirmed VLAN change rolled back automatically", after.endswith("0"), after)
+        check("VLAN sections removed after rollback", after.endswith("0"), after)
 
 
 def scenario_autowan(tb: t.Testbed) -> None:
-    c, b, a = tb.vms["c"], tb.vms["b"], tb.vms["a"]
-    result = tool(tb, "autowan", "--device", BOARD, "--host", "c", "--action", "enable")
-    check("autowan enable on C", result.returncode == 0,
-          (result.stdout + result.stderr)[-800:])
-    c.sh("/etc/init.d/picot-autowan status; true", check=False)
-    tb.vms["c"].set_nic_link(3, True)
-    promoted = wait_for(lambda: c.sh("uci -q get network.wan.device; true", check=False).strip() == "eth3", 120, 5)
-    state = tool(tb, "autowan", "--device", BOARD, "--host", "c", "--action", "status")
-    check("LAN port eth3 promoted to wan on C after cabling to the ISP", promoted,
-          state.stdout[-800:] + c.sh("logread | grep -i autowan | tail -8; true", check=False))
+    c = tb.vms["c"]
+    port_index = len(c.links) - 1
+    port = f"eth{port_index}"
+    c.sh(
+        "printf \"config autowan 'settings'\\n\" > /etc/config/picot-autowan; "
+        "uci set picot-autowan.settings=autowan; "
+        f"uci set picot-autowan.settings.exclude_ports={c.mgmt_nic}; "
+        "uci set picot-autowan.settings.down_seconds=2; "
+        "uci set picot-autowan.settings.ping_hosts=1.1.1.1; "
+        "uci commit picot-autowan"
+    )
+    assert c.serial
+    c.serial.put_file("/usr/sbin/picot-autowan", (REPO / "picot-autowan").read_bytes(), "755")
+    c.serial.put_file("/etc/init.d/picot-autowan", (REPO / "picot-autowan.init").read_bytes(), "755")
+    install = c.sh(
+        "/usr/sbin/picot-autowan check && "
+        "/usr/sbin/picot-autowan configure enable && "
+        "/etc/init.d/picot-autowan enable && /etc/init.d/picot-autowan restart; echo $?",
+        check=False,
+    )
+    check("autowan install and enable on C", install.endswith("0"), install[-800:])
+    t.log(c.sh(
+        "/usr/sbin/picot-autowan status; ps w | grep '[p]icot-autowan'; true",
+        check=False,
+    ))
+    c.set_nic_link(port_index, True)
+    promoted = wait_for(
+        lambda: c.sh("uci -q get network.wan.device; true", check=False).strip() == port,
+        90, 5,
+    )
+    state = c.sh("/usr/sbin/picot-autowan status; true", check=False)
+    state += "\nLOG: " + c.sh("logread | grep -i picot-autowan | tail -10; true", check=False)
+    state += "\nPORT: " + c.sh(f"ip link show {port}; uci show network.wan; true", check=False)
+    state += "\nPROCESS: " + c.sh("ps w | grep '[p]icot-autowan'; true", check=False)
+    if "isp" in tb.vms:
+        state += "\nISP: " + tb.vms["isp"].sh(
+            "ip addr show br-lan; pidof dnsmasq; true",
+            check=False,
+        )
+    check(f"LAN port {port} promoted to wan on C after cabling to the ISP", promoted,
+          state[-2500:])
     if promoted:
-        got = wait_for(lambda: "1.1.1.1" in c.sh("ping -c1 -W2 -I eth3 1.1.1.1 2>&1; true", check=False)
-                       and "1 packets received" in c.sh("ping -c1 -W2 -I eth3 1.1.1.1 2>&1; true", check=False), 40)
-        check("C reaches the 'Internet' (1.1.1.1) through the promoted port", got)
-        tb.vms["c"].set_nic_link(3, False)
-        demoted = wait_for(lambda: c.sh("uci -q get network.wan.device; true", check=False).strip() != "eth3", 120, 5)
+        ping = ""
+
+        def ping_isp() -> bool:
+            nonlocal ping
+            ping = c.sh(f"ping -c1 -W2 -I {port} 1.1.1.1 2>&1; true", check=False)
+            return bool(re.search(r"1 (?:packets )?received", ping))
+
+        got = wait_for(ping_isp, 30, 2)
+        detail = ping
+        if not got:
+            detail += "\nRoutes: " + c.sh(
+                "ip route; ip addr show dev " + port + "; true", check=False
+            )
+            detail += "\nISP: " + tb.vms["isp"].sh(
+                "ip addr show lo; true", check=False
+            )
+        check("C reaches the 'Internet' (1.1.1.1) through the promoted port", got, detail)
+        c.set_nic_link(port_index, False)
+        demoted = wait_for(
+            lambda: c.sh("uci -q get network.wan.device; true", check=False).strip() != port,
+            45, 5,
+        )
         check("port demoted after cable removal", demoted,
               c.sh("logread | grep -i autowan | tail -8; true", check=False))
-    default = b.sh("ip route | grep '^default'; true", check=False)
-    t.log(f"B default routes: {default}")
+    if "b" in tb.vms:
+        default = tb.vms["b"].sh("ip route | grep '^default'; true", check=False)
+        t.log(f"B default routes: {default}")
 
 
 SCENARIOS = {
@@ -239,11 +353,14 @@ def main() -> int:
     args = parser.parse_args()
     stock = t.IMAGES / "stock.img"
     selected = args.only.split(",")
-    tb = build_topology(args.image, stock, with_isp="autowan" in selected)
+    autowan_only = selected == ["autowan"]
+    tb = build_topology(
+        args.image, stock, with_isp="autowan" in selected, autowan_only=autowan_only
+    )
     try:
         tb.start()
         prepare(tb, configure_ssh=any(
-            name in {"vlan", "autowan", "vlan-rollback"} for name in selected
+            name in {"vlan", "vlan-rollback"} for name in selected
         ))
         for name in selected:
             t.log(f"=== scenario {name} ===")

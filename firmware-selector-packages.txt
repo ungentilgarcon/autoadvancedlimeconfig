@@ -3,3 +3,4 @@
 wpad-mesh-openssl
 luci
 nano-full
+vxlan
