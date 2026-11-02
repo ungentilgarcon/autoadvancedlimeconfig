@@ -18,6 +18,12 @@
   SHA-256 is
   `e4ec0f4eb362b608711f2ecb055798c59bf908a1c4e0b6aa8576055a71c80f0f`.
   This verifies image contents and ordering, not physical AP first boot.
+- Added a root-only `/usr/sbin/picot-wifi-configure` recovery command to the
+  image. It confirms before applying, backs up current LibreMesh/network/Wi-Fi
+  UCI files, regenerates config, and restarts the network and Wi-Fi. The
+  current private image, including this command, has SHA-256
+  `a4708ba64d410ecfcd2b3d12710b1dc06d9ca5585bc66d2287e671fecde95e35`.
+  Its actual behavior still requires a hardware pilot.
 
 ### VXLAN implementation and verification status
 

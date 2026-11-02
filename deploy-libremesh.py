@@ -655,7 +655,7 @@ def pass_fields_for_device(device: dict, values: dict[str, str]) -> tuple[str, s
     return result[0], result[1]
 
 
-def build_lime_wifi_defaults(main_key: str, mesh_key: str) -> str:
+def lime_wifi_uci_commands(main_key: str, mesh_key: str) -> list[str]:
     settings = {
         "ap_ssid": "villapicot",
         "ap_key": main_key,
@@ -668,8 +668,6 @@ def build_lime_wifi_defaults(main_key: str, mesh_key: str) -> str:
         "ieee80211s_key": mesh_key,
     }
     lines = [
-        "#!/bin/sh",
-        "set -eu",
         "uci set lime-node.wifi=lime",
         "uci -q delete lime-node.wifi.modes || true",
         "uci add_list lime-node.wifi.modes=ap",
@@ -680,8 +678,51 @@ def build_lime_wifi_defaults(main_key: str, mesh_key: str) -> str:
         f"uci set {shlex.quote(f'lime-node.wifi.{name}={value}')}"
         for name, value in settings.items()
     )
-    lines.extend(("uci commit lime-node", "exit 0", ""))
+    lines.append("uci commit lime-node")
     return "\n".join(lines)
+
+
+def build_lime_wifi_defaults(main_key: str, mesh_key: str) -> str:
+    return "\n".join(
+        [
+            "#!/bin/sh",
+            "set -eu",
+            lime_wifi_uci_commands(main_key, mesh_key),
+            "exit 0",
+            "",
+        ]
+    )
+
+
+def build_lime_wifi_recovery(main_key: str, mesh_key: str) -> str:
+    return "\n".join(
+        [
+            "#!/bin/sh",
+            "set -eu",
+            '[ "$(id -u)" -eq 0 ] || { echo "Run this command as root." >&2; exit 1; }',
+            'for command in uci lime-config lime-apply wifi; do',
+            '    command -v "$command" >/dev/null 2>&1 || { echo "Required command not found: $command" >&2; exit 1; }',
+            "done",
+            'printf "%s\\n" "This will regenerate LibreMesh Wi-Fi config and may disconnect the network."',
+            'printf "%s" "Type APPLY to continue: "',
+            'IFS= read -r answer || exit 1',
+            '[ "$answer" = APPLY ] || { echo "Cancelled."; exit 1; }',
+            "umask 077",
+            'backup_dir="/root/picot-wifi-config-backup-$(date +%Y%m%d-%H%M%S)"',
+            'mkdir -m 700 "$backup_dir"',
+            'for name in lime-node network wireless; do',
+            '    [ ! -f "/etc/config/$name" ] || cp -p "/etc/config/$name" "$backup_dir/$name"',
+            "done",
+            'printf "Previous config files saved under %s\\n" "$backup_dir"',
+            lime_wifi_uci_commands(main_key, mesh_key),
+            "lime-config",
+            "lime-apply",
+            "/etc/init.d/network restart",
+            "wifi reload",
+            'echo "LibreMesh Wi-Fi configuration applied."',
+            "",
+        ]
+    )
 
 
 def local_imagebuilder_dir(
@@ -848,7 +889,14 @@ def build_local_image(
         defaults_script.write_text(
             build_lime_wifi_defaults(main_key, mesh_key), encoding="ascii"
         )
-        defaults_script.chmod(0o755)
+        defaults_script.chmod(0o700)
+        recovery_dir = Path(files_dir) / "usr" / "sbin"
+        recovery_dir.mkdir(parents=True)
+        recovery_script = recovery_dir / "picot-wifi-configure"
+        recovery_script.write_text(
+            build_lime_wifi_recovery(main_key, mesh_key), encoding="ascii"
+        )
+        recovery_script.chmod(0o700)
         command = [
             "make",
             "-j2",
