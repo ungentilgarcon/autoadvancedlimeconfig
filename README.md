@@ -395,6 +395,8 @@ nano-full
 
 They are listed one per line in `firmware-selector-packages.txt`. Edit that
 file to change the normal package set. Lines beginning with `#` are comments.
+The `-wpad-basic-mbedtls` entry removes the Selector profile's default package,
+which conflicts with the required `wpad-mesh-openssl`.
 You can add extra package arguments without editing the file:
 
 ```sh

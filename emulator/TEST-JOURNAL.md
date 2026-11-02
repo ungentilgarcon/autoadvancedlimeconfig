@@ -9,6 +9,11 @@
   peers, and edge-to-gateway peers. Bridge-loop avoidance remains enabled.
 - Added `vxlan` and `ip-bridge` to the default firmware package list and
   gateway/edge underlay address fields to the config templates.
+- Built an Aruba AP-303 sysupgrade image after removing the Selector profile's
+  conflicting `wpad-basic-mbedtls` package. The verified image is
+  `openwrt-25.12.6-7946027b7240-ipq40xx-generic-aruba_ap-303-squashfs-sysupgrade.bin`
+  (SHA-256 `a0a280c4e46e145252dd40dff783827ff110c2f62a079642b8db62e73a412bf5`).
+  It has not been staged or flashed.
 - The complete `python3 emulator/run_scenarios.py --image ...` suite passed:
   three-node mesh pings and failover; VXLAN underlay with BLA enabled; apply,
   confirmation, DHCP, overlay ping, disable, and explicit rollback; and

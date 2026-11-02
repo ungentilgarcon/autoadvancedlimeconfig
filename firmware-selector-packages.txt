@@ -1,6 +1,9 @@
+
 # Extra OpenWrt packages listed in script_config_lime_AP.txt.
 # Add one package per line; deploy-libremesh.py also accepts --extra-packages.
 wpad-mesh-openssl
+# Replace the Selector profile's conflicting default wireless package.
+-wpad-basic-mbedtls
 luci
 nano-full
 vxlan
