@@ -399,17 +399,26 @@ def build_image(args: argparse.Namespace) -> Path | None:
         print(f"Resolved repositories: {json.dumps(request['repositories'], sort_keys=True)}")
         if args.inject_pass:
             values = read_equipment_pass(args.pass_file, require_vlan_keys=False)
-            pass_fields_for_device(device, values)
+            wifi_keys_from_pass(values)
             hostname = ap_hostname_from_pass(values)
+            admin_password = openwrt_admin_password_from_pass(values)
             print(f"LibreMesh hostname template: {hostname}")
             print("Password injection: local ImageBuilder; values are not sent to ASU.")
+            print(
+                "OpenWrt root password: "
+                + ("will be embedded as a local hash." if admin_password else "unchanged.")
+            )
         print("Dry run: no image build was requested.")
         return None
 
     if args.inject_pass:
         values = read_equipment_pass(args.pass_file, require_vlan_keys=False)
-        main_key, mesh_key = pass_fields_for_device(device, values)
+        main_key, mesh_key = wifi_keys_from_pass(values)
         hostname = ap_hostname_from_pass(values)
+        admin_password = openwrt_admin_password_from_pass(values)
+        admin_password_hash = (
+            hash_openwrt_admin_password(admin_password) if admin_password else ""
+        )
         return build_local_image(
             args=args,
             config=config,
@@ -420,6 +429,7 @@ def build_image(args: argparse.Namespace) -> Path | None:
             main_key=main_key,
             mesh_key=mesh_key,
             hostname=hostname,
+            admin_password_hash=admin_password_hash,
         )
 
     url = f"{config['asu_url']}/api/v1/build"
@@ -638,15 +648,7 @@ def read_equipment_pass(path: Path, require_vlan_keys: bool = True) -> dict[str,
     return values
 
 
-def pass_fields_for_device(device: dict, values: dict[str, str]) -> tuple[str, str]:
-    if device["profile"] not in {
-        "aruba_ap-303",
-        "xiaomi_redmi-router-ax6000-ubootmod",
-    }:
-        raise DeployError(
-            "--inject-pass currently supports aruba-ap-303 and "
-            "redmi-ax6000-ubootmod only"
-        )
+def wifi_keys_from_pass(values: dict[str, str]) -> tuple[str, str]:
     result = []
     for name in ("MAIN_WIFI_KEY", "MESH_WIFI_KEY"):
         value = values.get(name, "")
@@ -675,6 +677,62 @@ def ap_hostname_from_pass(values: dict[str, str]) -> str:
             "characters and optional LibreMesh %M1-%M6 or %H tokens"
         )
     return hostname
+
+
+def openwrt_admin_password_from_pass(values: dict[str, str]) -> str:
+    password = values.get("OPENWRT_ADMIN_PASSWORD", "")
+    if password and (
+        not 12 <= len(password) <= 128
+        or not password.isascii()
+        or any(ord(char) < 32 or ord(char) > 126 for char in password)
+    ):
+        raise DeployError(
+            "OPENWRT_ADMIN_PASSWORD in .pass must be 12-128 printable ASCII characters"
+        )
+    return password
+
+
+def hash_openwrt_admin_password(password: str) -> str:
+    openssl = shutil.which("openssl")
+    if not openssl:
+        raise DeployError(
+            "Setting OPENWRT_ADMIN_PASSWORD requires OpenSSL on the build computer"
+        )
+    result = subprocess.run(
+        [openssl, "passwd", "-6", "-stdin"],
+        input=password + "\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode:
+        raise DeployError("OpenSSL could not hash OPENWRT_ADMIN_PASSWORD")
+    password_hash = result.stdout.strip()
+    if not re.fullmatch(r"\$6\$[A-Za-z0-9./]+\$[A-Za-z0-9./]+", password_hash):
+        raise DeployError("OpenSSL returned an invalid SHA-512 password hash")
+    return password_hash
+
+
+def root_password_update_commands(password_hash: str) -> list[str]:
+    if not password_hash:
+        return []
+    awk_program = (
+        'BEGIN { OFS=":" } '
+        '$1 == "root" { $2=password_hash; changed=1 } '
+        '{ print } END { if (!changed) exit 1 }'
+    )
+    return [
+        '[ -f /etc/shadow ] || { echo "Root password database not found." >&2; exit 1; }',
+        'shadow_tmp="/etc/shadow.picot.$$"',
+        (
+            f"awk -F: -v password_hash={shlex.quote(password_hash)} "
+            f"{shlex.quote(awk_program)} /etc/shadow > \"$shadow_tmp\" "
+            '|| { rm -f "$shadow_tmp"; echo "Could not update root password." >&2; exit 1; }'
+        ),
+        'chown 0:0 "$shadow_tmp"',
+        'chmod 600 "$shadow_tmp"',
+        'mv -f "$shadow_tmp" /etc/shadow',
+    ]
 
 
 def lime_node_uci_commands(
@@ -709,13 +767,14 @@ def lime_node_uci_commands(
 
 
 def build_lime_wifi_defaults(
-    main_key: str, mesh_key: str, hostname: str
+    main_key: str, mesh_key: str, hostname: str, admin_password_hash: str = ""
 ) -> str:
     return "\n".join(
         [
             "#!/bin/sh",
             "set -eu",
             lime_node_uci_commands(main_key, mesh_key, hostname),
+            *root_password_update_commands(admin_password_hash),
             "exit 0",
             "",
         ]
@@ -723,8 +782,24 @@ def build_lime_wifi_defaults(
 
 
 def build_lime_wifi_recovery(
-    main_key: str, mesh_key: str, hostname: str
+    main_key: str,
+    mesh_key: str,
+    hostname: str,
+    admin_password_hash: str = "",
 ) -> str:
+    prompt = (
+        "This will update LibreMesh config and root password; network access may drop."
+        if admin_password_hash
+        else "This will regenerate LibreMesh Wi-Fi config and may disconnect the network."
+    )
+    backup_shadow = (
+        [
+            '[ -f /etc/shadow ] || { echo "Root password database not found." >&2; exit 1; }',
+            'cp -p /etc/shadow "$backup_dir/shadow"',
+        ]
+        if admin_password_hash
+        else []
+    )
     return "\n".join(
         [
             "#!/bin/sh",
@@ -733,7 +808,7 @@ def build_lime_wifi_recovery(
             'for command in uci lime-config lime-apply wifi; do',
             '    command -v "$command" >/dev/null 2>&1 || { echo "Required command not found: $command" >&2; exit 1; }',
             "done",
-            'printf "%s\\n" "This will regenerate LibreMesh Wi-Fi config and may disconnect the network."',
+            f"printf '%s\\n' {shlex.quote(prompt)}",
             'printf "%s" "Type APPLY to continue: "',
             'IFS= read -r answer || exit 1',
             '[ "$answer" = APPLY ] || { echo "Cancelled."; exit 1; }',
@@ -743,8 +818,10 @@ def build_lime_wifi_recovery(
             'for name in lime-node network wireless; do',
             '    [ ! -f "/etc/config/$name" ] || cp -p "/etc/config/$name" "$backup_dir/$name"',
             "done",
+            *backup_shadow,
             'printf "Previous config files saved under %s\\n" "$backup_dir"',
             lime_node_uci_commands(main_key, mesh_key, hostname),
+            *root_password_update_commands(admin_password_hash),
             "lime-config",
             "lime-apply",
             "/etc/init.d/network restart",
@@ -868,6 +945,7 @@ def build_local_image(
     main_key: str,
     mesh_key: str,
     hostname: str,
+    admin_password_hash: str,
 ) -> Path:
     if not shutil.which("gawk"):
         raise DeployError(
@@ -918,14 +996,20 @@ def build_local_image(
         defaults_dir.mkdir(parents=True)
         defaults_script = defaults_dir / "90zz-lime-wifi"
         defaults_script.write_text(
-            build_lime_wifi_defaults(main_key, mesh_key, hostname), encoding="ascii"
+            build_lime_wifi_defaults(
+                main_key, mesh_key, hostname, admin_password_hash
+            ),
+            encoding="ascii",
         )
         defaults_script.chmod(0o700)
         recovery_dir = Path(files_dir) / "usr" / "sbin"
         recovery_dir.mkdir(parents=True)
         recovery_script = recovery_dir / "picot-wifi-configure"
         recovery_script.write_text(
-            build_lime_wifi_recovery(main_key, mesh_key, hostname), encoding="ascii"
+            build_lime_wifi_recovery(
+                main_key, mesh_key, hostname, admin_password_hash
+            ),
+            encoding="ascii",
         )
         recovery_script.chmod(0o700)
         command = [
@@ -938,6 +1022,8 @@ def build_local_image(
         ]
         print("Building locally with the matching OpenWrt ImageBuilder.")
         print("Wi-Fi and mesh credentials stay local; do not share the resulting image.")
+        if admin_password_hash:
+            print("The OpenWrt root password is embedded as a hash.")
         try:
             result = subprocess.run(
                 command,
@@ -951,7 +1037,7 @@ def build_local_image(
             raise DeployError("Local ImageBuilder timed out") from error
         if result.returncode:
             details = result.stdout + "\n" + result.stderr
-            for secret in (main_key, mesh_key):
+            for secret in (main_key, mesh_key, admin_password_hash):
                 if secret:
                     details = details.replace(secret, "[redacted]")
             raise DeployError(
@@ -1317,8 +1403,8 @@ def add_build_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--inject-pass",
         action="store_true",
-        help="Embed the Aruba/PICOT0 Wi-Fi and mesh keys from the private .pass "
-        "using a local ImageBuilder; secrets are not sent to ASU",
+        help="Use shared Wi-Fi, mesh, hostname and optional root-password fields "
+        "from .pass with a local ImageBuilder; values are not sent to ASU",
     )
     parser.add_argument(
         "--pass-file",

@@ -1,10 +1,9 @@
 # Copy to .pass, chmod 600 .pass, then fill values privately.
 # Values are plain text; do not commit .pass or paste it into chat.
 #
-# Router admin passwords are not used by the deployment tool; it connects
-# with SSH keys and strict host-key checking.
-REDMI_ADMIN_PASSWORD=
-ARUBA_ADMIN_PASSWORD=
+# Optional shared OpenWrt root password for local --inject-pass builds.
+# Use 12-128 printable ASCII characters; blank leaves it unchanged.
+OPENWRT_ADMIN_PASSWORD=
 
 # Shared LibreMesh credentials used by Aruba and Redmi builds.
 MAIN_WIFI_KEY=

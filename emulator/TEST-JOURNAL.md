@@ -24,14 +24,19 @@
 - Both generated scripts set the earlier PICOT AP hostname template
   `PICOT-ap-%M4%M5%M6` in `lime-node.system.hostname`, as well as the Wi-Fi and
   mesh settings. Rebuilt image SHA-256:
-  `901f0cebc30610ae2252eaffb66325247ab7c8a8fef2ab6331cb7ca56d24a6ea`.
+  `ae60d2b3bd024f13fbeb6c3a4ed2d5064617e9f7029e274a8ec5d005b976cd4a`.
   Physical AP behavior still requires a hardware pilot.
 - Consolidated the active Wi-Fi keys into the shared `.pass` fields
   `MAIN_WIFI_KEY` and `MESH_WIFI_KEY` for both supported device profiles, and
   made the hostname template configurable through `AP_HOSTNAME`. Migrated the
   ignored local `.pass` from the existing matching per-device fields without
-  adding any credentials to Git. The rebuilt image retains the same checksum
-  because the current values match the previous embedded settings.
+  adding any credentials to Git.
+- Replaced the per-device admin-password entries with the shared optional
+  `OPENWRT_ADMIN_PASSWORD`. When nonblank, the local builder SHA-512-hashes it
+  and both scripts update the root shadow entry; recovery backs up `/etc/shadow`.
+  The local field is blank, so this build intentionally does not change the
+  root password. Hashing, generated script syntax, and shadow update logic were
+  tested with a temporary test password.
 
 ### VXLAN implementation and verification status
 

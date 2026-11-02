@@ -30,7 +30,7 @@ it on a device with a configuration rollback available.
 | `restore-libremesh-config.sh` | On-device interactive restore for the saved PICOT0 config or the device's captured pre-upgrade config. |
 | `apply-libremesh-vlans.sh` | Applies or removes managed VLAN UCI sections on a device with a timed rollback and explicit confirmation. |
 | `picot-vlan-recovery` | Boot-time recovery hook; restores a pending transaction before network startup if the node reboots. |
-| `.pass.example` | Credential-file template; private `.pass` is ignored by Git and supplies shared Wi-Fi/mesh keys, AP hostname, and VLAN SSID keys. |
+| `.pass.example` | Credential-file template; private `.pass` is ignored by Git and supplies shared Wi-Fi/mesh keys, AP hostname, optional root password, and VLAN SSID keys. |
 | `vlan-configs/*.example` | Inactive UCI templates. Set per-node role/radios/SSIDs here; Wi-Fi keys stay in `.pass`. |
 | `firmware-selector-packages.txt` | Extra OpenWrt packages to request by default. |
 | `backup-PICOT0-2026-10-30/` | Saved PICOT0 `/etc` backup, including `etc/config`. It is the source of the PICOT0-specific rollback archive. |
@@ -161,11 +161,12 @@ the current PICOT0 values were copied from the saved config, and the backups
 remain unchanged. Set `AP_HOSTNAME` to the LibreMesh hostname template for
 these nodes. The template's current value, `PICOT-ap-%M4%M5%M6`, gives each
 node a MAC-derived name. The file also has VLAN SSID keys; fill those locally.
+`OPENWRT_ADMIN_PASSWORD` is an optional shared root password for locally built
+images; leave it blank to keep the root password unchanged.
 The VLAN deployer requires
 `IOT_WIFI_KEY` and `GUEST_WIFI_KEY`, each 8–63 printable ASCII characters.
 Use the same value per SSID across APs if clients should roam. The router
-admin password fields are not used by deployment; SSH uses public-key
-authentication and strict host-key checking.
+deployment commands still use SSH keys and strict host-key checking.
 
 The local `.pass` file is already created. If it is missing, initialize it
 from the template and restrict access:
@@ -477,11 +478,20 @@ python3 deploy-libremesh.py build \
 
 This reads the shared `MAIN_WIFI_KEY`, `MESH_WIFI_KEY`, and `AP_HOSTNAME` from
 the private `.pass` file, then uses the matching OpenWrt ImageBuilder on this
-computer. The same credential fields are used for Aruba and Redmi builds.
+computer. The same credential fields are used for all profiles supported by local
+credential injection.
 The ImageBuilder is downloaded from the OpenWrt release site and cached under
 `~/.cache/libremesh-deploy/`; the values are not sent to Selector/ASU.
 Install GNU `gawk` if the local build reports it missing. An already extracted
 matching ImageBuilder can be selected with `--imagebuilder-dir PATH`.
+
+Optionally set `OPENWRT_ADMIN_PASSWORD` in `.pass` to set the device's root
+password. This shared field applies to every device supported by the local
+credential-injection path. Use 12–128 printable ASCII characters; leave it
+blank to leave the root password unchanged. The build hashes it locally with
+SHA-512 crypt and embeds only the hash in the first-boot and recovery scripts.
+The plain password is not sent to Selector/ASU. This does not enable SSH
+password authentication; deployment continues to use SSH keys.
 
 The resulting sysupgrade image contains the credentials in readable form and
 is written owner-only under `firmware-output/`; do not commit, publish, or
@@ -499,8 +509,9 @@ The image also includes a root-only recovery command at
 settings did not take effect, run it from a root SSH or serial-console session.
 It asks for `APPLY`, backs up the current `lime-node`, `network`, and `wireless`
 UCI files under `/root/`, sets the same hostname and Wi-Fi/mesh settings, then
-regenerates and applies LibreMesh configuration. The network restart may
-disconnect your session; use local recovery access.
+regenerates and applies LibreMesh configuration. If an admin password is
+configured, it also backs up `/etc/shadow` and updates the root password.
+The network restart may disconnect your session; use local recovery access.
 This recovery command is only present in the rebuilt credentialed image.
 
 The build command can optionally send a first-boot UCI-defaults script to the
