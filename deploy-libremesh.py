@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 import re
 import shlex
 import shutil
@@ -309,6 +310,11 @@ def fetch_profile(config: dict, version: str, device: dict) -> tuple[dict, dict,
 
 
 def build_image(args: argparse.Namespace) -> Path | None:
+    if args.inject_pass and args.uci_defaults:
+        raise DeployError(
+            "--inject-pass cannot be combined with --uci-defaults; "
+            "credentials are only embedded by the local ImageBuilder path"
+        )
     config = selector_config()
     status, versions = http_json(f"{config['image_url']}/.versions.json")
     if status != 200:
@@ -391,8 +397,26 @@ def build_image(args: argparse.Namespace) -> Path | None:
         print(f"OpenWrt packages: {' '.join(asu_packages) or '(none)'}")
         print(f"LibreMesh packages: {' '.join(lime_packages) or '(none)'}")
         print(f"Resolved repositories: {json.dumps(request['repositories'], sort_keys=True)}")
+        if args.inject_pass:
+            values = read_equipment_pass(args.pass_file, require_vlan_keys=False)
+            pass_fields_for_device(device, values)
+            print("Password injection: local ImageBuilder; values are not sent to ASU.")
         print("Dry run: no image build was requested.")
         return None
+
+    if args.inject_pass:
+        values = read_equipment_pass(args.pass_file, require_vlan_keys=False)
+        main_key, mesh_key = pass_fields_for_device(device, values)
+        return build_local_image(
+            args=args,
+            config=config,
+            device=device,
+            version=version,
+            packages=asu_packages + lime_packages,
+            repositories=request["repositories"],
+            main_key=main_key,
+            mesh_key=mesh_key,
+        )
 
     url = f"{config['asu_url']}/api/v1/build"
     print(f"Selector stable release: {version}")
@@ -608,6 +632,290 @@ def read_equipment_pass(path: Path, require_vlan_keys: bool = True) -> dict[str,
         ):
             raise DeployError(f"{name} in .pass must be 8-63 printable ASCII characters")
     return values
+
+
+def pass_fields_for_device(device: dict, values: dict[str, str]) -> tuple[str, str]:
+    if device["profile"] == "aruba_ap-303":
+        main_name, mesh_name = "ARUBA_MAIN_WIFI_KEY", "ARUBA_MESH_KEY"
+    elif device["profile"] == "xiaomi_redmi-router-ax6000-ubootmod":
+        main_name, mesh_name = "PICOT0_MAIN_WIFI_KEY", "PICOT0_MESH_KEY"
+    else:
+        raise DeployError(
+            "--inject-pass currently supports aruba-ap-303 and "
+            "redmi-ax6000-ubootmod only"
+        )
+    result = []
+    for name in (main_name, mesh_name):
+        value = values.get(name, "")
+        if not 8 <= len(value) <= 63 or not value.isascii() or any(
+            ord(char) < 32 or ord(char) > 126 for char in value
+        ):
+            raise DeployError(f"{name} in .pass must be 8-63 printable ASCII characters")
+        result.append(value)
+    return result[0], result[1]
+
+
+def build_lime_wifi_defaults(main_key: str, mesh_key: str) -> str:
+    settings = {
+        "ap_ssid": "villapicot",
+        "ap_key": main_key,
+        "ap_encryption": "psk2",
+        "apname_ssid": "villapicot",
+        "apname_key": main_key,
+        "apname_encryption": "psk2",
+        "ieee80211s_mesh_id": "picotMESH",
+        "ieee80211s_encryption": "psk2+aes",
+        "ieee80211s_key": mesh_key,
+    }
+    lines = [
+        "#!/bin/sh",
+        "set -eu",
+        "uci set lime-node.wifi=lime",
+        "uci -q delete lime-node.wifi.modes || true",
+        "uci add_list lime-node.wifi.modes=ap",
+        "uci add_list lime-node.wifi.modes=apname",
+        "uci add_list lime-node.wifi.modes=ieee80211s",
+    ]
+    lines.extend(
+        f"uci set {shlex.quote(f'lime-node.wifi.{name}={value}')}"
+        for name, value in settings.items()
+    )
+    lines.extend(("uci commit lime-node", "exit 0", ""))
+    return "\n".join(lines)
+
+
+def local_imagebuilder_dir(
+    args: argparse.Namespace, config: dict, version: str, target: str
+) -> tuple[Path, str]:
+    if platform.system() != "Linux" or platform.machine() not in ("x86_64", "amd64"):
+        raise DeployError(
+            "Local credential injection requires the Linux x86_64 OpenWrt ImageBuilder"
+        )
+    if args.imagebuilder_dir:
+        builder = args.imagebuilder_dir.expanduser().resolve()
+        if not (builder / "Makefile").is_file():
+            raise DeployError(f"ImageBuilder Makefile not found in {builder}")
+        version_file = builder / "include" / "version.mk"
+        if not version_file.is_file() or not re.search(
+            rf"^VERSION_NUMBER:=[^\n]*{re.escape(version)}",
+            version_file.read_text(encoding="utf-8"),
+            re.MULTILINE,
+        ):
+            raise DeployError(
+                f"ImageBuilder at {builder} is not for OpenWrt {version}"
+            )
+        return builder, ""
+
+    target_name, subtarget = target.split("/", 1)
+    archive_name = (
+        f"openwrt-imagebuilder-{version}-{target_name}-{subtarget}."
+        "Linux-x86_64.tar.zst"
+    )
+    base_url = (
+        f"{config['image_url'].rstrip('/')}/releases/{version}/targets/"
+        f"{target_name}/{subtarget}/"
+    )
+    archive_url = urllib.parse.urljoin(base_url, archive_name)
+    cache_root = Path.home() / ".cache" / "libremesh-deploy" / "imagebuilder"
+    cache_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    builder = cache_root / archive_name.removesuffix(".tar.zst")
+    if (builder / "Makefile").is_file():
+        return builder, archive_url
+
+    manifest_request = urllib.request.Request(
+        urllib.parse.urljoin(base_url, "sha256sums"),
+        headers={"User-Agent": USER_AGENT},
+    )
+    try:
+        with urllib.request.urlopen(manifest_request, timeout=60) as response:
+            manifest = response.read().decode("ascii")
+    except (urllib.error.URLError, TimeoutError, OSError, UnicodeError) as error:
+        raise DeployError(f"Could not retrieve ImageBuilder checksums: {error}") from error
+    expected_hash = None
+    for line in manifest.splitlines():
+        match = re.match(r"^([0-9a-fA-F]{64})\s+\*?(.+?)\s*$", line)
+        if match and Path(match.group(2).lstrip("*")).name == archive_name:
+            expected_hash = match.group(1).lower()
+            break
+    if not expected_hash:
+        raise DeployError(f"No SHA-256 entry for {archive_name}")
+
+    archive_path = cache_root / archive_name
+    temporary_archive = archive_path.with_suffix(archive_path.suffix + ".part")
+    archive_request = urllib.request.Request(
+        archive_url, headers={"User-Agent": USER_AGENT}
+    )
+    try:
+        with urllib.request.urlopen(archive_request, timeout=180) as response:
+            with temporary_archive.open("wb") as output:
+                shutil.copyfileobj(response, output)
+    except (urllib.error.URLError, TimeoutError, OSError) as error:
+        temporary_archive.unlink(missing_ok=True)
+        raise DeployError(f"Could not download ImageBuilder: {error}") from error
+    actual_hash = hashlib.sha256(temporary_archive.read_bytes()).hexdigest()
+    if actual_hash != expected_hash:
+        temporary_archive.unlink(missing_ok=True)
+        raise DeployError(
+            f"ImageBuilder checksum mismatch: expected {expected_hash}, received {actual_hash}"
+        )
+    temporary_archive.replace(archive_path)
+
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="libremesh-imagebuilder-", dir=cache_root
+        ) as extraction_dir:
+            result = subprocess.run(
+                ["tar", "--zstd", "-xf", str(archive_path), "-C", extraction_dir],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode:
+                raise DeployError(
+                    "Could not extract ImageBuilder: "
+                    + (result.stderr.strip() or f"tar exited {result.returncode}")
+                )
+            roots = [
+                path for path in Path(extraction_dir).iterdir()
+                if path.is_dir() and (path / "Makefile").is_file()
+            ]
+            if len(roots) != 1:
+                raise DeployError("ImageBuilder archive did not contain one build tree")
+            shutil.move(str(roots[0]), str(builder))
+    except FileExistsError as error:
+        raise DeployError(f"ImageBuilder cache path already exists: {builder}") from error
+    return builder, archive_url
+
+
+def build_local_image(
+    args: argparse.Namespace,
+    config: dict,
+    device: dict,
+    version: str,
+    packages: list[str],
+    repositories: dict[str, str],
+    main_key: str,
+    mesh_key: str,
+) -> Path:
+    if not shutil.which("gawk"):
+        raise DeployError(
+            "Local ImageBuilder requires GNU awk; install the gawk package and retry"
+        )
+    builder, imagebuilder_url = local_imagebuilder_dir(
+        args, config, version, device["target"]
+    )
+    repo_file = builder / "repositories"
+    if not repo_file.is_file():
+        raise DeployError(f"ImageBuilder repositories file not found: {repo_file}")
+    repo_lines = repo_file.read_text(encoding="utf-8").splitlines()
+    for url in repositories.values():
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme != "https" or parsed.hostname not in {
+            "downloads.openwrt.org",
+            "feed.libremesh.org",
+        }:
+            raise DeployError(f"Unexpected package repository URL: {url}")
+        if url not in repo_lines:
+            repo_lines.append(url)
+    repo_file.write_text("\n".join(repo_lines) + "\n", encoding="utf-8")
+
+    keys_dir = builder / "keys"
+    keys_dir.mkdir(exist_ok=True)
+    saved_key = False
+    for index, key in enumerate(config.get("repository_keys", [])):
+        if not isinstance(key, str):
+            continue
+        key = key.strip()
+        if key.startswith("-----BEGIN PUBLIC KEY-----"):
+            (keys_dir / f"libremesh-feed-{index}.pem").write_text(
+                key + "\n", encoding="ascii"
+            )
+            saved_key = True
+        elif re.fullmatch(r"[A-Za-z0-9+/=]+", key):
+            (keys_dir / f"libremesh-feed-{index}.pub").write_text(
+                key + "\n", encoding="ascii"
+            )
+            saved_key = True
+    if not saved_key:
+        raise DeployError("Selector did not provide a package feed signing key")
+
+    output_dir = args.output_dir.expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="libremesh-pass-files-") as files_dir:
+        defaults_dir = Path(files_dir) / "etc" / "uci-defaults"
+        defaults_dir.mkdir(parents=True)
+        defaults_script = defaults_dir / "98-lime-wifi"
+        defaults_script.write_text(
+            build_lime_wifi_defaults(main_key, mesh_key), encoding="ascii"
+        )
+        defaults_script.chmod(0o755)
+        command = [
+            "make",
+            "-j2",
+            "image",
+            f"PROFILE={device['profile']}",
+            f"PACKAGES={' '.join(unique(packages))}",
+            f"FILES={files_dir}",
+        ]
+        print("Building locally with the matching OpenWrt ImageBuilder.")
+        print("Wi-Fi and mesh credentials stay local; do not share the resulting image.")
+        try:
+            result = subprocess.run(
+                command,
+                cwd=builder,
+                capture_output=True,
+                text=True,
+                timeout=args.build_timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise DeployError("Local ImageBuilder timed out") from error
+        if result.returncode:
+            details = result.stdout + "\n" + result.stderr
+            for secret in (main_key, mesh_key):
+                if secret:
+                    details = details.replace(secret, "[redacted]")
+            raise DeployError(
+                "Local ImageBuilder failed: "
+                + details.strip()[-3000:]
+            )
+
+    target_name, subtarget = device["target"].split("/", 1)
+    image_dir = builder / "bin" / "targets" / target_name / subtarget
+    candidates = sorted(image_dir.glob(f"*{device['profile']}*sysupgrade.bin"))
+    if len(candidates) != 1:
+        raise DeployError(
+            f"Expected one local sysupgrade image for {device['profile']}, "
+            f"found {len(candidates)} in {image_dir}"
+        )
+    image_name = candidates[0].name
+    output = output_dir / f"{image_name.removesuffix('.bin')}-with-pass.bin"
+    temporary = output.with_suffix(output.suffix + ".part")
+    shutil.copyfile(candidates[0], temporary)
+    temporary.chmod(0o600)
+    temporary.replace(output)
+    digest = hashlib.sha256(output.read_bytes()).hexdigest()
+    metadata = {
+        "device": args.device,
+        "board": device["board"],
+        "profile": device["profile"],
+        "target": device["target"],
+        "openwrt_version": version,
+        "libremesh_feed": args.feed_branch,
+        "extra_packages": read_extra_packages(args),
+        "image": output.name,
+        "sha256": digest,
+        "build_method": "local ImageBuilder",
+        "credentials_embedded": True,
+        "imagebuilder_url": imagebuilder_url,
+    }
+    metadata_path = output_dir / f"{output.name}.build.json"
+    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+    metadata_path.chmod(0o600)
+    print(f"Built local image with first-boot LibreMesh Wi-Fi settings: {output}")
+    print(f"SHA-256: {digest}")
+    print("The image contains readable network credentials; keep it private.")
+    return output
 
 
 def configure_vlans(args: argparse.Namespace) -> None:
@@ -928,6 +1236,23 @@ def add_package_options(parser: argparse.ArgumentParser) -> None:
 def add_build_options(parser: argparse.ArgumentParser) -> None:
     add_device_option(parser)
     parser.add_argument(
+        "--inject-pass",
+        action="store_true",
+        help="Embed the Aruba/PICOT0 Wi-Fi and mesh keys from the private .pass "
+        "using a local ImageBuilder; secrets are not sent to ASU",
+    )
+    parser.add_argument(
+        "--pass-file",
+        type=Path,
+        default=DEFAULT_PASS_FILE,
+        help="Private credential file for --inject-pass (default: .pass)",
+    )
+    parser.add_argument(
+        "--imagebuilder-dir",
+        type=Path,
+        help="Use an already extracted, matching ImageBuilder instead of downloading it",
+    )
+    parser.add_argument(
         "--target",
         help="Build target such as ipq40xx/generic; only needed if the profile "
         "exists for several targets",
@@ -1049,6 +1374,16 @@ def main() -> int:
 
     args = parser.parse_args()
     try:
+        if (
+            args.command == "deploy"
+            and getattr(args, "inject_pass", False)
+            and getattr(args, "flash", False)
+        ):
+            raise DeployError(
+                "--inject-pass images require a fresh first boot, but deploy --flash "
+                "preserves the current config. Build and stage the image, then install "
+                "it with config reset using local recovery access."
+            )
         if args.command == "build":
             build_image(args)
         elif args.command == "stage":

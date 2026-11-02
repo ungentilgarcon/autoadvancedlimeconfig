@@ -14,6 +14,21 @@
   `openwrt-25.12.6-7946027b7240-ipq40xx-generic-aruba_ap-303-squashfs-sysupgrade.bin`
   (SHA-256 `a0a280c4e46e145252dd40dff783827ff110c2f62a079642b8db62e73a412bf5`).
   It has not been staged or flashed.
+- Added `build --inject-pass` to create a credentialed image with the matching
+  local OpenWrt ImageBuilder. It reads private `.pass` values locally and does
+  not submit them to ASU. The AP-303's `lime-node.wifi` first-boot settings
+  reuse the saved PICOT0 main-Wi-Fi and mesh credentials; the Aruba keys in
+  `.pass` are populated locally and remain ignored by Git.
+- A local AP-303 ImageBuilder build succeeded. Output:
+  `firmware-output/openwrt-25.12.6-ipq40xx-generic-aruba_ap-303-squashfs-sysupgrade-with-pass.bin`
+  (SHA-256 `b22ea1f7976a2965cf8c4a7f97479aa3c62d34a8edb4deb3f05d9497cc42066d`).
+  The resulting image contains readable network credentials; its mode is
+  owner-only. It has not been staged or flashed.
+- First-boot defaults only apply on a fresh install/config reset. The existing
+  deploy flash path preserves configuration, so the new `--inject-pass`
+  option is blocked with `deploy --flash` rather than silently producing an
+  image whose Wi-Fi defaults do not run. AP-303 radio and Ethernet behavior
+  still require local recovery access and a hardware pilot.
 - The complete `python3 emulator/run_scenarios.py --image ...` suite passed:
   three-node mesh pings and failover; VXLAN underlay with BLA enabled; apply,
   confirmation, DHCP, overlay ping, disable, and explicit rollback; and

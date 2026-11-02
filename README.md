@@ -462,6 +462,33 @@ The image and a `.build.json` metadata file are written under
 `firmware-output/`. The version in the example is illustrative; check Selector
 availability before pinning an old release.
 
+#### Embed Wi-Fi and mesh credentials locally
+
+To include the saved Aruba Wi-Fi and mesh credentials in a first-boot setup,
+use the explicit local-only option:
+
+```sh
+python3 deploy-libremesh.py build \
+  --device aruba-ap-303 \
+  --inject-pass
+```
+
+This reads `ARUBA_MAIN_WIFI_KEY` and `ARUBA_MESH_KEY` from the private `.pass`
+file, then uses the matching OpenWrt ImageBuilder on this computer. The
+ImageBuilder is downloaded from the OpenWrt release site and cached under
+`~/.cache/libremesh-deploy/`; the credentials are not sent to Selector/ASU.
+Install GNU `gawk` if the local build reports it missing. An already extracted
+matching ImageBuilder can be selected with `--imagebuilder-dir PATH`.
+
+The resulting sysupgrade image contains the credentials in readable form and
+is written owner-only under `firmware-output/`; do not commit, publish, or
+send it to anyone. It sets the LibreMesh `lime-node.wifi` defaults on a fresh
+first boot. Preserving an existing configuration with `sysupgrade -c` prevents
+first-boot defaults from running; do not use `deploy --inject-pass --flash`.
+Install with a supported clean-install/config-reset method only when local
+recovery access is available. This does not guarantee Aruba radio or Ethernet
+behavior, which still needs a device pilot.
+
 The build command can optionally send a first-boot UCI-defaults script to the
 Selector:
 
@@ -472,8 +499,9 @@ python3 deploy-libremesh.py build \
 ```
 
 That script will execute on the device as part of first boot. Do not use
-unreviewed scripts here. The deployment script itself does not currently
-provide an automatic firstboot VLAN or mesh conversion.
+unreviewed scripts here. Its contents are sent to the remote Selector/ASU
+service; never put credentials in this script. The deployment script does not
+provide an automatic firstboot VLAN conversion.
 
 ### 3. Stage the image without flashing (recommended first device step)
 
