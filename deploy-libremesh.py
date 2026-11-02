@@ -844,7 +844,7 @@ def build_local_image(
     with tempfile.TemporaryDirectory(prefix="libremesh-pass-files-") as files_dir:
         defaults_dir = Path(files_dir) / "etc" / "uci-defaults"
         defaults_dir.mkdir(parents=True)
-        defaults_script = defaults_dir / "98-lime-wifi"
+        defaults_script = defaults_dir / "90zz-lime-wifi"
         defaults_script.write_text(
             build_lime_wifi_defaults(main_key, mesh_key), encoding="ascii"
         )

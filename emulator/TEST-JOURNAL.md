@@ -2,6 +2,23 @@
 
 ## 2026-11-02
 
+### Credentialed first-boot script ordering correction
+
+- The first credentialed Aruba image included its UCI-defaults script, but
+  named it `98-lime-wifi`, which runs after LibreMesh's `91_lime-config`
+  script. That meant LibreMesh generated Wi-Fi config before the requested
+  `lime-node.wifi` settings were applied.
+- Moved the customization script earlier in the defaults sequence so
+  `91_lime-config` sees the settings during first-boot generation. Rebuild
+  the image before installing; the previous credentialed image has this bug.
+- Rebuilt the private AP-303 image and verified the embedded executable
+  `/etc/uci-defaults/90zz-lime-wifi` sorts before
+  `/etc/uci-defaults/91_lime-config`, passes `sh -n`, and successfully issues
+  all 15 expected UCI operations against a mock `uci` command. The new image
+  SHA-256 is
+  `e4ec0f4eb362b608711f2ecb055798c59bf908a1c4e0b6aa8576055a71c80f0f`.
+  This verifies image contents and ordering, not physical AP first boot.
+
 ### VXLAN implementation and verification status
 
 - Replaced the managed `bat0.10`/`bat0.20` transport with separate VXLAN

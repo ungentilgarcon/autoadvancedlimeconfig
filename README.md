@@ -482,12 +482,13 @@ matching ImageBuilder can be selected with `--imagebuilder-dir PATH`.
 
 The resulting sysupgrade image contains the credentials in readable form and
 is written owner-only under `firmware-output/`; do not commit, publish, or
-send it to anyone. It sets the LibreMesh `lime-node.wifi` defaults on a fresh
-first boot. Preserving an existing configuration with `sysupgrade -c` prevents
-first-boot defaults from running; do not use `deploy --inject-pass --flash`.
-Install with a supported clean-install/config-reset method only when local
-recovery access is available. This does not guarantee Aruba radio or Ethernet
-behavior, which still needs a device pilot.
+send it to anyone. The first-boot script runs before LibreMesh's
+`91_lime-config` defaults script so generated Wi-Fi config uses these settings.
+Preserving an existing configuration with `sysupgrade -c` prevents first-boot
+defaults from running; do not use `deploy --inject-pass --flash`. Install with
+a supported clean-install/config-reset method only when local recovery access
+is available. This does not guarantee Aruba radio or Ethernet behavior, which
+still needs a device pilot.
 
 The build command can optionally send a first-boot UCI-defaults script to the
 Selector:
