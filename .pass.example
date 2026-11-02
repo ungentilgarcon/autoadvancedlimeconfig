@@ -6,15 +6,15 @@
 REDMI_ADMIN_PASSWORD=
 ARUBA_ADMIN_PASSWORD=
 
-# Existing network credentials, for reference/configuration tasks.
-PICOT0_MAIN_WIFI_KEY=
-PICOT0_APNAME_WIFI_KEY=
-PICOT0_MESH_KEY=
+# Shared LibreMesh credentials used by Aruba and Redmi builds.
+MAIN_WIFI_KEY=
+MESH_WIFI_KEY=
+AP_HOSTNAME=PICOT-ap-%M4%M5%M6
+
+# Historical Redmi archive credentials; not used by custom image builds.
 REDMI_ARCHIVE_MAIN_WIFI_KEY=
 REDMI_ARCHIVE_APNAME_WIFI_KEY=
 REDMI_ARCHIVE_MESH_KEY=
-ARUBA_MAIN_WIFI_KEY=
-ARUBA_MESH_KEY=
 
 # Required by deploy-libremesh.py vlans.
 IOT_WIFI_KEY=

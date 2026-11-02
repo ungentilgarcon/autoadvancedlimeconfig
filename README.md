@@ -30,7 +30,7 @@ it on a device with a configuration rollback available.
 | `restore-libremesh-config.sh` | On-device interactive restore for the saved PICOT0 config or the device's captured pre-upgrade config. |
 | `apply-libremesh-vlans.sh` | Applies or removes managed VLAN UCI sections on a device with a timed rollback and explicit confirmation. |
 | `picot-vlan-recovery` | Boot-time recovery hook; restores a pending transaction before network startup if the node reboots. |
-| `.pass.example` | Credential-file template; private `.pass` is ignored by Git and supplies VLAN SSID keys. |
+| `.pass.example` | Credential-file template; private `.pass` is ignored by Git and supplies shared Wi-Fi/mesh keys, AP hostname, and VLAN SSID keys. |
 | `vlan-configs/*.example` | Inactive UCI templates. Set per-node role/radios/SSIDs here; Wi-Fi keys stay in `.pass`. |
 | `firmware-selector-packages.txt` | Extra OpenWrt packages to request by default. |
 | `backup-PICOT0-2026-10-30/` | Saved PICOT0 `/etc` backup, including `etc/config`. It is the source of the PICOT0-specific rollback archive. |
@@ -156,9 +156,11 @@ this VLAN change alone and must be verified before relying on it.
 
 The templates in `vlan-configs/` are disabled and contain no Wi-Fi keys.
 The private `.pass` file contains equipment credentials and is excluded from
-Git. Current PICOT0 Wi-Fi/mesh keys were copied into it from the saved config;
-the backups themselves remain unchanged. It has fields for other device
-credentials and the new VLAN SSID keys; blank values must be filled locally.
+Git. `MAIN_WIFI_KEY` and `MESH_WIFI_KEY` are shared by Aruba and Redmi builds;
+the current PICOT0 values were copied from the saved config, and the backups
+remain unchanged. Set `AP_HOSTNAME` to the LibreMesh hostname template for
+these nodes. The template's current value, `PICOT-ap-%M4%M5%M6`, gives each
+node a MAC-derived name. The file also has VLAN SSID keys; fill those locally.
 The VLAN deployer requires
 `IOT_WIFI_KEY` and `GUEST_WIFI_KEY`, each 8–63 printable ASCII characters.
 Use the same value per SSID across APs if clients should roam. The router
@@ -473,10 +475,11 @@ python3 deploy-libremesh.py build \
   --inject-pass
 ```
 
-This reads `ARUBA_MAIN_WIFI_KEY` and `ARUBA_MESH_KEY` from the private `.pass`
-file, then uses the matching OpenWrt ImageBuilder on this computer. The
-ImageBuilder is downloaded from the OpenWrt release site and cached under
-`~/.cache/libremesh-deploy/`; the credentials are not sent to Selector/ASU.
+This reads the shared `MAIN_WIFI_KEY`, `MESH_WIFI_KEY`, and `AP_HOSTNAME` from
+the private `.pass` file, then uses the matching OpenWrt ImageBuilder on this
+computer. The same credential fields are used for Aruba and Redmi builds.
+The ImageBuilder is downloaded from the OpenWrt release site and cached under
+`~/.cache/libremesh-deploy/`; the values are not sent to Selector/ASU.
 Install GNU `gawk` if the local build reports it missing. An already extracted
 matching ImageBuilder can be selected with `--imagebuilder-dir PATH`.
 

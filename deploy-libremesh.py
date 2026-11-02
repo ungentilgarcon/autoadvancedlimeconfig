@@ -400,6 +400,8 @@ def build_image(args: argparse.Namespace) -> Path | None:
         if args.inject_pass:
             values = read_equipment_pass(args.pass_file, require_vlan_keys=False)
             pass_fields_for_device(device, values)
+            hostname = ap_hostname_from_pass(values)
+            print(f"LibreMesh hostname template: {hostname}")
             print("Password injection: local ImageBuilder; values are not sent to ASU.")
         print("Dry run: no image build was requested.")
         return None
@@ -407,6 +409,7 @@ def build_image(args: argparse.Namespace) -> Path | None:
     if args.inject_pass:
         values = read_equipment_pass(args.pass_file, require_vlan_keys=False)
         main_key, mesh_key = pass_fields_for_device(device, values)
+        hostname = ap_hostname_from_pass(values)
         return build_local_image(
             args=args,
             config=config,
@@ -416,6 +419,7 @@ def build_image(args: argparse.Namespace) -> Path | None:
             repositories=request["repositories"],
             main_key=main_key,
             mesh_key=mesh_key,
+            hostname=hostname,
         )
 
     url = f"{config['asu_url']}/api/v1/build"
@@ -635,17 +639,16 @@ def read_equipment_pass(path: Path, require_vlan_keys: bool = True) -> dict[str,
 
 
 def pass_fields_for_device(device: dict, values: dict[str, str]) -> tuple[str, str]:
-    if device["profile"] == "aruba_ap-303":
-        main_name, mesh_name = "ARUBA_MAIN_WIFI_KEY", "ARUBA_MESH_KEY"
-    elif device["profile"] == "xiaomi_redmi-router-ax6000-ubootmod":
-        main_name, mesh_name = "PICOT0_MAIN_WIFI_KEY", "PICOT0_MESH_KEY"
-    else:
+    if device["profile"] not in {
+        "aruba_ap-303",
+        "xiaomi_redmi-router-ax6000-ubootmod",
+    }:
         raise DeployError(
             "--inject-pass currently supports aruba-ap-303 and "
             "redmi-ax6000-ubootmod only"
         )
     result = []
-    for name in (main_name, mesh_name):
+    for name in ("MAIN_WIFI_KEY", "MESH_WIFI_KEY"):
         value = values.get(name, "")
         if not 8 <= len(value) <= 63 or not value.isascii() or any(
             ord(char) < 32 or ord(char) > 126 for char in value
@@ -655,7 +658,28 @@ def pass_fields_for_device(device: dict, values: dict[str, str]) -> tuple[str, s
     return result[0], result[1]
 
 
-def lime_node_uci_commands(main_key: str, mesh_key: str) -> list[str]:
+def ap_hostname_from_pass(values: dict[str, str]) -> str:
+    hostname = values.get("AP_HOSTNAME", "")
+    valid_hostname = re.fullmatch(
+        r"(?:[A-Za-z0-9]|%M[1-6]|%H)(?:[A-Za-z0-9.-]|%M[1-6]|%H)*",
+        hostname,
+    )
+    if (
+        not hostname
+        or len(hostname) > 63
+        or not valid_hostname
+        or hostname.endswith(("-", "."))
+    ):
+        raise DeployError(
+            "AP_HOSTNAME in .pass must be 1-63 characters using hostname "
+            "characters and optional LibreMesh %M1-%M6 or %H tokens"
+        )
+    return hostname
+
+
+def lime_node_uci_commands(
+    main_key: str, mesh_key: str, hostname: str
+) -> list[str]:
     settings = {
         "ap_ssid": "villapicot",
         "ap_key": main_key,
@@ -669,7 +693,7 @@ def lime_node_uci_commands(main_key: str, mesh_key: str) -> list[str]:
     }
     lines = [
         "uci set lime-node.system=lime",
-        "uci set lime-node.system.hostname=PICOT-ap-%M4%M5%M6",
+        f"uci set {shlex.quote(f'lime-node.system.hostname={hostname}')}",
         "uci set lime-node.wifi=lime",
         "uci -q delete lime-node.wifi.modes || true",
         "uci add_list lime-node.wifi.modes=ap",
@@ -684,19 +708,23 @@ def lime_node_uci_commands(main_key: str, mesh_key: str) -> list[str]:
     return "\n".join(lines)
 
 
-def build_lime_wifi_defaults(main_key: str, mesh_key: str) -> str:
+def build_lime_wifi_defaults(
+    main_key: str, mesh_key: str, hostname: str
+) -> str:
     return "\n".join(
         [
             "#!/bin/sh",
             "set -eu",
-            lime_node_uci_commands(main_key, mesh_key),
+            lime_node_uci_commands(main_key, mesh_key, hostname),
             "exit 0",
             "",
         ]
     )
 
 
-def build_lime_wifi_recovery(main_key: str, mesh_key: str) -> str:
+def build_lime_wifi_recovery(
+    main_key: str, mesh_key: str, hostname: str
+) -> str:
     return "\n".join(
         [
             "#!/bin/sh",
@@ -716,7 +744,7 @@ def build_lime_wifi_recovery(main_key: str, mesh_key: str) -> str:
             '    [ ! -f "/etc/config/$name" ] || cp -p "/etc/config/$name" "$backup_dir/$name"',
             "done",
             'printf "Previous config files saved under %s\\n" "$backup_dir"',
-            lime_node_uci_commands(main_key, mesh_key),
+            lime_node_uci_commands(main_key, mesh_key, hostname),
             "lime-config",
             "lime-apply",
             "/etc/init.d/network restart",
@@ -839,6 +867,7 @@ def build_local_image(
     repositories: dict[str, str],
     main_key: str,
     mesh_key: str,
+    hostname: str,
 ) -> Path:
     if not shutil.which("gawk"):
         raise DeployError(
@@ -889,14 +918,14 @@ def build_local_image(
         defaults_dir.mkdir(parents=True)
         defaults_script = defaults_dir / "90zz-lime-wifi"
         defaults_script.write_text(
-            build_lime_wifi_defaults(main_key, mesh_key), encoding="ascii"
+            build_lime_wifi_defaults(main_key, mesh_key, hostname), encoding="ascii"
         )
         defaults_script.chmod(0o700)
         recovery_dir = Path(files_dir) / "usr" / "sbin"
         recovery_dir.mkdir(parents=True)
         recovery_script = recovery_dir / "picot-wifi-configure"
         recovery_script.write_text(
-            build_lime_wifi_recovery(main_key, mesh_key), encoding="ascii"
+            build_lime_wifi_recovery(main_key, mesh_key, hostname), encoding="ascii"
         )
         recovery_script.chmod(0o700)
         command = [

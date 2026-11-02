@@ -26,6 +26,12 @@
   mesh settings. Rebuilt image SHA-256:
   `901f0cebc30610ae2252eaffb66325247ab7c8a8fef2ab6331cb7ca56d24a6ea`.
   Physical AP behavior still requires a hardware pilot.
+- Consolidated the active Wi-Fi keys into the shared `.pass` fields
+  `MAIN_WIFI_KEY` and `MESH_WIFI_KEY` for both supported device profiles, and
+  made the hostname template configurable through `AP_HOSTNAME`. Migrated the
+  ignored local `.pass` from the existing matching per-device fields without
+  adding any credentials to Git. The rebuilt image retains the same checksum
+  because the current values match the previous embedded settings.
 
 ### VXLAN implementation and verification status
 
