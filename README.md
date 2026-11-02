@@ -482,8 +482,9 @@ matching ImageBuilder can be selected with `--imagebuilder-dir PATH`.
 
 The resulting sysupgrade image contains the credentials in readable form and
 is written owner-only under `firmware-output/`; do not commit, publish, or
-send it to anyone. The first-boot script runs before LibreMesh's
-`91_lime-config` defaults script so generated Wi-Fi config uses these settings.
+send it to anyone. The first-boot script sets the PICOT AP hostname template
+and Wi-Fi/mesh settings before LibreMesh's `91_lime-config` defaults script
+generates the device config.
 Preserving an existing configuration with `sysupgrade -c` prevents first-boot
 defaults from running; do not use `deploy --inject-pass --flash`. Install with
 a supported clean-install/config-reset method only when local recovery access
@@ -494,8 +495,9 @@ The image also includes a root-only recovery command at
 `/usr/sbin/picot-wifi-configure`. If the device boots but the first-boot
 settings did not take effect, run it from a root SSH or serial-console session.
 It asks for `APPLY`, backs up the current `lime-node`, `network`, and `wireless`
-UCI files under `/root/`, then regenerates and applies LibreMesh configuration.
-The network restart may disconnect your session; use local recovery access.
+UCI files under `/root/`, sets the same hostname and Wi-Fi/mesh settings, then
+regenerates and applies LibreMesh configuration. The network restart may
+disconnect your session; use local recovery access.
 This recovery command is only present in the rebuilt credentialed image.
 
 The build command can optionally send a first-boot UCI-defaults script to the

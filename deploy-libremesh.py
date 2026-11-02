@@ -655,7 +655,7 @@ def pass_fields_for_device(device: dict, values: dict[str, str]) -> tuple[str, s
     return result[0], result[1]
 
 
-def lime_wifi_uci_commands(main_key: str, mesh_key: str) -> list[str]:
+def lime_node_uci_commands(main_key: str, mesh_key: str) -> list[str]:
     settings = {
         "ap_ssid": "villapicot",
         "ap_key": main_key,
@@ -668,6 +668,8 @@ def lime_wifi_uci_commands(main_key: str, mesh_key: str) -> list[str]:
         "ieee80211s_key": mesh_key,
     }
     lines = [
+        "uci set lime-node.system=lime",
+        "uci set lime-node.system.hostname=PICOT-ap-%M4%M5%M6",
         "uci set lime-node.wifi=lime",
         "uci -q delete lime-node.wifi.modes || true",
         "uci add_list lime-node.wifi.modes=ap",
@@ -687,7 +689,7 @@ def build_lime_wifi_defaults(main_key: str, mesh_key: str) -> str:
         [
             "#!/bin/sh",
             "set -eu",
-            lime_wifi_uci_commands(main_key, mesh_key),
+            lime_node_uci_commands(main_key, mesh_key),
             "exit 0",
             "",
         ]
@@ -714,7 +716,7 @@ def build_lime_wifi_recovery(main_key: str, mesh_key: str) -> str:
             '    [ ! -f "/etc/config/$name" ] || cp -p "/etc/config/$name" "$backup_dir/$name"',
             "done",
             'printf "Previous config files saved under %s\\n" "$backup_dir"',
-            lime_wifi_uci_commands(main_key, mesh_key),
+            lime_node_uci_commands(main_key, mesh_key),
             "lime-config",
             "lime-apply",
             "/etc/init.d/network restart",

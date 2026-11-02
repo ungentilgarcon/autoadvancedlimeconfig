@@ -20,10 +20,12 @@
   This verifies image contents and ordering, not physical AP first boot.
 - Added a root-only `/usr/sbin/picot-wifi-configure` recovery command to the
   image. It confirms before applying, backs up current LibreMesh/network/Wi-Fi
-  UCI files, regenerates config, and restarts the network and Wi-Fi. The
-  current private image, including this command, has SHA-256
-  `a4708ba64d410ecfcd2b3d12710b1dc06d9ca5585bc66d2287e671fecde95e35`.
-  Its actual behavior still requires a hardware pilot.
+  UCI files, regenerates config, and restarts the network and Wi-Fi.
+- Both generated scripts set the earlier PICOT AP hostname template
+  `PICOT-ap-%M4%M5%M6` in `lime-node.system.hostname`, as well as the Wi-Fi and
+  mesh settings. Rebuilt image SHA-256:
+  `901f0cebc30610ae2252eaffb66325247ab7c8a8fef2ab6331cb7ca56d24a6ea`.
+  Physical AP behavior still requires a hardware pilot.
 
 ### VXLAN implementation and verification status
 
