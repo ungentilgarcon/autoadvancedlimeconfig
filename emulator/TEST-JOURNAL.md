@@ -2,7 +2,28 @@
 
 ## 2026-11-02
 
-### VXLAN feasibility
+### VXLAN implementation and verification status
+
+- Replaced the managed `bat0.10`/`bat0.20` transport with separate VXLAN
+  interfaces and bridges (VNIs 1010/1020), gateway broadcast-replication
+  peers, and edge-to-gateway peers. Bridge-loop avoidance remains enabled.
+- Added `vxlan` and `ip-bridge` to the default firmware package list and
+  gateway/edge underlay address fields to the config templates.
+- The complete `python3 emulator/run_scenarios.py --image ...` suite passed:
+  three-node mesh pings and failover; VXLAN underlay with BLA enabled; apply,
+  confirmation, DHCP, overlay ping, disable, and explicit rollback; and
+  autowan promotion, connectivity, and demotion.
+- The runner isolates autowan on its own ISP topology. It also resolves the
+  management NIC by MAC and delays serial-console probing until the VM boots,
+  avoiding the earlier combined-topology and GRUB-input failures.
+- Explicit rollback was tested; the automatic 180-second rollback timer was
+  not allowed to expire. This x86 image cannot test real-radio association,
+  Aruba/Xiaomi hardware, or actual router flashing. No physical device was
+  changed.
+
+## 2026-11-02
+
+### Earlier VXLAN feasibility (superseded by the verification above)
 
 - Added the OpenWrt `vxlan` protocol package to the default firmware package
   list; it depends on the kernel-matched `kmod-vxlan`.

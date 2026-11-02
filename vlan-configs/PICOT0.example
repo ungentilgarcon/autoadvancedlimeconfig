@@ -4,3 +4,5 @@ config vlan 'settings'
 	option radios 'radio0 radio1'
 	option iot_ssid 'villapicot-IOT'
 	option guest_ssid 'villapicot-GUEST'
+	# Add one list peer_ips entry per VLAN-enabled edge node's mesh-reachable LAN IP.
+	# Example: list peer_ips '10.100.10.2'

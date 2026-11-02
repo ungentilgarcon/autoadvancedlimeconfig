@@ -4,3 +4,5 @@ config vlan 'settings'
 	option radios 'radio0 radio1'
 	option iot_ssid 'villapicot-IOT'
 	option guest_ssid 'villapicot-GUEST'
+	# Set this to the gateway's mesh-reachable LAN IP.
+	# Example: option gateway_ip '10.100.10.1'

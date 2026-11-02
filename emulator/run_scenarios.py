@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Run the repository's tools against a 4-VM virtual network.
+"""Run the repository's tools against isolated QEMU network scenarios.
 
-Topology (triangle of LibreMesh nodes plus one plain-OpenWrt "ISP"):
+Mesh topology (triangle of LibreMesh nodes):
 
-    A --ab-- B --bc-- C --ac-- A          wired mesh links (eth0/eth2 ...)
-    A.eth1 (stock "wan" port) --isp-- ISP
-    C.eth3 (a normal LAN port, cable unplugged at start) --isp-- ISP
+    A --ab-- B --bc-- C --ac-- A
+
+The autowan scenario runs on a separate C-plus-ISP topology to avoid exposing
+the other scenarios' management links to the ISP's DHCP service.
 
 Usage: run_scenarios.py [--only mesh,failover,vlan,vlan-rollback,autowan]
 """
@@ -45,7 +46,7 @@ def wait_for(fn, timeout: float, interval: float = 5) -> bool:
     return False
 
 
-def tool(tb: t.Testbed, *args: str, timeout: int = 400) -> subprocess.CompletedProcess:
+def tool(tb: t.Testbed, *args: str, timeout: int = 150) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, str(REPO / "deploy-libremesh.py"), *args],
         env=tb.env(), capture_output=True, text=True, timeout=timeout, check=False,
@@ -98,12 +99,71 @@ def prepare(tb: t.Testbed, configure_ssh: bool = True) -> None:
             "uci -q delete network.testmgmt; uci set network.testmgmt=interface; "
             f"uci set network.testmgmt.device={vm.mgmt_nic}; "
             "uci set network.testmgmt.proto=static; "
-            "uci set network.testmgmt.ipaddr=10.0.2.15/24; uci commit network; true"
+            f"uci set network.testmgmt.ipaddr={t.MGMT_CIDR}; "
+            "uci commit network; true"
+        )
+        vm.sh(
+            "uci set firewall.testmgmt=zone; "
+            "uci set firewall.testmgmt.name=testmgmt; "
+            "uci add_list firewall.testmgmt.network=testmgmt; "
+            "uci set firewall.testmgmt.input=ACCEPT; "
+            "uci set firewall.testmgmt.output=ACCEPT; "
+            "uci set firewall.testmgmt.forward=ACCEPT; "
+            "uci commit firewall; true"
+        )
+        vm.sh(
+            f"ip addr del {t.MGMT_CIDR} dev {vm.mgmt_nic} 2>/dev/null || true; "
+            f"ip addr add {t.MGMT_CIDR} dev {vm.mgmt_nic}; "
+            f"ip link set dev {vm.mgmt_nic} up; true"
         )
     for index, name in enumerate((n for n in "abc" if n in tb.vms), start=1):
         tb.vms[name].sh(f"ip addr add 10.77.0.{index}/24 dev bat0")
     if configure_ssh:
         tb.setup_ssh([n for n in tb.vms if n != "isp"])
+
+
+def ensure_vxlan_packages(tb: t.Testbed) -> None:
+    for vm in tb.vms.values():
+        if vm.name == "isp":
+            continue
+        ready = vm.sh(
+            "test -r /lib/netifd/proto/vxlan.sh && "
+            "test -x /usr/sbin/bridge && echo READY",
+            check=False,
+        ).endswith("READY")
+        install = ""
+        if not ready:
+            install = vm.sh("apk add vxlan ip-bridge", timeout=120, check=False)
+            ready = vm.sh(
+                "test -r /lib/netifd/proto/vxlan.sh && "
+                "test -x /usr/sbin/bridge && echo READY",
+                check=False,
+            ).endswith("READY")
+            if ready:
+                vm.sh("/etc/init.d/network restart", timeout=60)
+        check(f"VXLAN packages available on {vm.name}", ready, install[-500:])
+        if not ready:
+            raise t.TestbedError(f"{vm.name}: vxlan/ip-bridge packages unavailable")
+
+
+def ensure_test_radios(tb: t.Testbed) -> None:
+    for vm in tb.vms.values():
+        if vm.name == "isp":
+            continue
+        for radio in ("radio0", "radio1"):
+            present = vm.sh(
+                f"uci -q get wireless.{radio}.band >/dev/null && echo PRESENT",
+                check=False,
+            ).endswith("PRESENT")
+            if not present:
+                vm.sh(
+                    f"uci set wireless.{radio}=wifi-device; "
+                    f"uci set wireless.{radio}.type=mac80211; "
+                    f"uci set wireless.{radio}.band=5g; "
+                    f"uci set wireless.{radio}.channel=36; "
+                    f"uci set wireless.{radio}.disabled=1; "
+                    "uci commit wireless"
+                )
 
 
 def scenario_mesh(tb: t.Testbed) -> None:
@@ -134,15 +194,32 @@ def scenario_failover(tb: t.Testbed) -> None:
 
 def write_vlan_config(role: str, directory: Path) -> Path:
     path = directory / f"{role}.conf"
+    underlay = (
+        "\tlist peer_ips '10.78.0.2'\n"
+        if role == "gateway"
+        else "\toption gateway_ip '10.78.0.1'\n"
+    )
     path.write_text(
         "config vlan 'settings'\n\toption enabled '1'\n"
         f"\toption role '{role}'\n\toption radios 'radio0 radio1'\n"
         "\toption iot_ssid 'testbed-IOT'\n\toption guest_ssid 'testbed-GUEST'\n"
+        + underlay
     )
     return path
 
 
 def scenario_vlan(tb: t.Testbed) -> None:
+    for index, name in enumerate("abc", start=1):
+        tb.vms[name].sh(f"ip addr add 10.78.0.{index}/24 dev br-lan")
+    underlay = wait_for(
+        lambda: tb.vms["a"].sh("ping -c2 -W2 10.78.0.2 >/dev/null", check=False) == "",
+        60,
+    )
+    if not check("VXLAN underlay reachable over LAN bridge with BLA enabled",
+                 underlay and tb.vms["a"].sh(
+                     "batctl meshif bat0 bridge_loop_avoidance", check=False
+                 ) == "enabled"):
+        return
     with tempfile.TemporaryDirectory(dir=t.STATE) as directory:
         directory = Path(directory)
         passfile = directory / "pass"
@@ -158,62 +235,73 @@ def scenario_vlan(tb: t.Testbed) -> None:
             result = tool(tb, "vlans", *common, "--host", name, "--config", str(cfg))
             check(f"vlans apply on {name}", result.returncode == 0,
                   (result.stdout + result.stderr)[-800:])
-            if result.returncode == 0:
-                match = re.search(r"VLAN_CHANGE_ID=([0-9-]+)", result.stdout)
-                if not match:
-                    check(f"vlan-confirm on {name}", False, "apply output omitted change ID")
-                else:
-                    confirm = tool(
-                        tb, "vlan-confirm", "--device", BOARD, "--host", name,
-                        "--change-id", match.group(1),
-                    )
-                    check(f"vlan-confirm on {name}", confirm.returncode == 0,
-                          (confirm.stdout + confirm.stderr)[-500:])
+            if result.returncode:
+                return
+            match = re.search(r"VLAN_CHANGE_ID=([0-9-]+)", result.stdout)
+            if not match:
+                check(f"vlan-confirm on {name}", False, "apply output omitted change ID")
+                return
+            confirm = tool(
+                tb, "vlan-confirm", "--device", BOARD, "--host", name,
+                "--change-id", match.group(1),
+            )
+            if not check(f"vlan-confirm on {name}", confirm.returncode == 0,
+                         (confirm.stdout + confirm.stderr)[-500:]):
+                return
         a, b, c = (tb.vms[n] for n in "abc")
-        check("bat0.10 and bat0.20 exist on gateway",
-              a.sh("ip link show bat0.10 >/dev/null && ip link show bat0.20 >/dev/null; echo $?", check=False).endswith("0"))
+        check("IoT and guest VXLAN bridges exist on gateway",
+              a.sh(
+                  "ip link show picot_vx_iot >/dev/null && "
+                  "ip link show picot_vx_guest >/dev/null && "
+                  "ip link show br-picot-iot >/dev/null && "
+                  "ip link show br-picot-guest >/dev/null; echo $?",
+                  check=False,
+              ).endswith("0"))
+        fdb = a.sh("bridge fdb show dev picot_vx_iot; true", check=False)
+        check("gateway VXLAN replicates broadcasts to edge B",
+              "10.78.0.2" in fdb, fdb[-500:])
         a.sh(
             "uci set dhcp.@dnsmasq[0].logdhcp=1; uci commit dhcp; "
             "/etc/init.d/dnsmasq restart"
         )
         lease = b.sh(
-            "udhcpc -i bat0.10 -n -q -t 3 -T 2 -s /bin/true 2>&1 || true",
+            "udhcpc -i br-picot-iot -n -q -t 3 -T 2 -s /bin/true 2>&1 || true",
             timeout=15,
             check=False,
         )
         if "lease of 192.168.10." not in lease:
             lease += "\ngateway: " + a.sh(
-                "ip -d link show bat0.10; ip -4 addr show dev bat0.10; "
+                "ip -d link show picot_vx_iot; ip -4 addr show dev br-picot-iot; "
                 "uci show dhcp.picot_vlan_iot_dhcp; uci show network.picot_vlan_iot; "
                 "grep -hE 'interface=|dhcp-range=' /var/etc/dnsmasq.conf.* 2>/dev/null; "
                 "nft list chain inet fw4 input 2>&1; "
                 "logread | grep -E 'dnsmasq|DHCP' | tail -10; "
-                "batctl meshif bat0 vid 10 vlan_json 2>&1; "
+                "bridge fdb show dev picot_vx_iot; "
                 "batctl meshif bat0 n | head -5",
                 check=False,
             )
             lease += "\nedge: " + b.sh(
-                "ip -d link show bat0.10; ip -4 addr show dev bat0.10; "
-                "ip neigh show dev bat0.10; "
-                "batctl meshif bat0 vid 10 vlan_json 2>&1; "
+                "ip -d link show picot_vx_iot; ip -4 addr show dev br-picot-iot; "
+                "ip neigh show dev br-picot-iot; "
+                "bridge fdb show dev picot_vx_iot; "
                 "batctl meshif bat0 n | head -5",
                 check=False,
             )
-        check("edge node gets an IoT (VLAN 10) lease from the gateway over bat0.10",
+        check("edge gets an IoT DHCP lease over VXLAN",
               "lease of 192.168.10." in lease, lease[-2500:])
         a.sh(
-            "nft insert rule inet fw4 input iifname 'bat0.10' "
+            "nft insert rule inet fw4 input iifname 'br-picot-iot' "
             "ip protocol icmp accept"
         )
         vlan_ping = b.sh(
-            "ip addr add 192.168.10.2/24 dev bat0.10; "
+            "ip addr add 192.168.10.2/24 dev br-picot-iot; "
             "ping -c2 -W2 192.168.10.1 2>&1; result=$?; "
-            "ip neigh show dev bat0.10; "
-            "ip addr del 192.168.10.2/24 dev bat0.10; echo PING_STATUS=$result",
+            "ip neigh show dev br-picot-iot; "
+            "ip addr del 192.168.10.2/24 dev br-picot-iot; echo PING_STATUS=$result",
             timeout=30,
             check=False,
         )
-        check("edge reaches gateway across bat0.10 with static test address",
+        check("edge reaches gateway across VXLAN with static test address",
               "PING_STATUS=0" in vlan_ping, vlan_ping[-500:])
         ips = {n: mesh_ip(tb.vms[n]) for n in "abc"}
         check("non-VLAN node C still reaches VLAN gateway A",
@@ -226,8 +314,14 @@ def scenario_vlan(tb: t.Testbed) -> None:
         if result.returncode == 0:
             match = re.search(r"VLAN_CHANGE_ID=([0-9-]+)", result.stdout)
             if match:
-                tool(tb, "vlan-confirm", "--device", BOARD, "--host", "b",
-                     "--change-id", match.group(1))
+                confirm = tool(
+                    tb, "vlan-confirm", "--device", BOARD, "--host", "b",
+                    "--change-id", match.group(1),
+                )
+                if not check("vlan-confirm on edge B",
+                             confirm.returncode == 0,
+                             (confirm.stdout + confirm.stderr)[-500:]):
+                    return
         gone = b.sh("uci -q show network | grep -c picot_vlan; true", check=False).strip()
         check("VLAN sections removed on B", gone.endswith("0"), gone)
         check("B still meshes with VLAN gateway A after --disable",
@@ -353,23 +447,34 @@ def main() -> int:
     args = parser.parse_args()
     stock = t.IMAGES / "stock.img"
     selected = args.only.split(",")
-    autowan_only = selected == ["autowan"]
-    tb = build_topology(
-        args.image, stock, with_isp="autowan" in selected, autowan_only=autowan_only
-    )
-    try:
-        tb.start()
-        prepare(tb, configure_ssh=any(
-            name in {"vlan", "vlan-rollback"} for name in selected
-        ))
-        for name in selected:
-            t.log(f"=== scenario {name} ===")
-            try:
-                SCENARIOS[name](tb)
-            except Exception as error:  # noqa: BLE001
-                check(f"scenario {name} ran without error", False, repr(error)[:600])
-    finally:
-        tb.stop()
+    batches = [[name for name in selected if name in {"mesh", "failover", "vlan"}]]
+    if "vlan-rollback" in selected:
+        batches.append(["vlan-rollback"])
+    if "autowan" in selected:
+        batches.append(["autowan"])
+    for batch in (batch for batch in batches if batch):
+        autowan_only = batch == ["autowan"]
+        tb = build_topology(
+            args.image, stock, with_isp=autowan_only, autowan_only=autowan_only
+        )
+        try:
+            tb.start()
+            if any(name in {"vlan", "vlan-rollback"} for name in batch):
+                ensure_vxlan_packages(tb)
+                ensure_test_radios(tb)
+            prepare(tb, configure_ssh=any(
+                name in {"vlan", "vlan-rollback"} for name in batch
+            ))
+            for name in batch:
+                t.log(f"=== scenario {name} ===")
+                try:
+                    SCENARIOS[name](tb)
+                except Exception as error:  # noqa: BLE001
+                    check(f"scenario {name} ran without error", False, repr(error)[:600])
+        except t.TestbedError as error:
+            check(f"testbed setup for {','.join(batch)}", False, str(error)[:1200])
+        finally:
+            tb.stop()
     print("\n==== SUMMARY ====")
     for name, ok, detail in RESULTS:
         print(f"{'PASS' if ok else 'FAIL'}  {name}")

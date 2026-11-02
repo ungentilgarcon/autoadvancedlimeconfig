@@ -33,6 +33,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 IMAGES = ROOT / "images"
 STATE = ROOT / "state"
+MGMT_IP = "10.0.2.15"
+MGMT_CIDR = f"{MGMT_IP}/24"
+MGMT_NETWORK = "10.0.2.0/24"
 
 
 class TestbedError(Exception):
@@ -223,6 +226,7 @@ class VM:
         self.rundir = rundir
         self.memory = memory
         self.ssh_port = ssh_port
+        self._mgmt_nic: str | None = None
         self.process: subprocess.Popen | None = None
         self.serial_path = rundir / f"{name}.serial"
         self.monitor_path = rundir / f"{name}.monitor"
@@ -230,11 +234,10 @@ class VM:
         self.serial: Serial | None = None
         self.log_file = rundir / f"{name}.qemu.log"
 
-    # NIC order is fixed: ethN follows the order of `links`, the management
-    # NIC (when ssh_port is set) comes last.
+    # Linux interface numbering can vary, so wait_ready resolves this by MAC.
     @property
     def mgmt_nic(self) -> str | None:
-        return f"eth{len(self.links)}" if self.ssh_port else None
+        return self._mgmt_nic if self.ssh_port else None
 
     def start(self) -> None:
         subprocess.run(
@@ -265,7 +268,8 @@ class VM:
         if self.ssh_port:
             args += [
                 "-netdev",
-                f"user,id=mgmt,net=10.0.2.0/24,hostfwd=tcp:127.0.0.1:{self.ssh_port}-10.0.2.15:22",
+                f"user,id=mgmt,net={MGMT_NETWORK},"
+                f"hostfwd=tcp:127.0.0.1:{self.ssh_port}-{MGMT_IP}:22",
                 "-device",
                 f"virtio-net-pci,netdev=mgmt,mac=52:54:00:{self.index:02x}:ff:01",
             ]
@@ -277,20 +281,28 @@ class VM:
     def wait_ready(self) -> None:
         assert self.serial
         self.serial.connect()
-        for attempt in range(6):
-            self.monitor("sendkey ret")
-            try:
-                self.serial.wait_shell(timeout=12)
-                break
-            except TestbedError:
-                if attempt == 5:
-                    raise
-                log(f"{self.name}: console not ready; retrying GRUB Enter")
+        time.sleep(5)
+        self.monitor("sendkey ret")
+        time.sleep(10)
+        self.serial.wait_shell(timeout=90)
+        if self.ssh_port:
+            mac = f"52:54:00:{self.index:02x}:ff:01"
+            status, output = self.serial.run(
+                "ip -o link | awk -v mac='" + mac + "' "
+                "'index(tolower($0), tolower(mac)) { split($2, parts, \"@\"); "
+                "sub(/:$/, \"\", parts[1]); print parts[1]; exit }'",
+                timeout=10,
+            )
+            if status or not output.strip():
+                raise TestbedError(
+                    f"could not locate management NIC {mac} on {self.name}"
+                )
+            self._mgmt_nic = output.strip().splitlines()[0]
         if self.mgmt_nic:
             self.sh(
                 f"batctl meshif bat0 interface del {self.mgmt_nic} 2>/dev/null || true; "
                 f"ip link set {self.mgmt_nic} nomaster 2>/dev/null || true; "
-                f"ip addr add 10.0.2.15/24 dev {self.mgmt_nic}; "
+                f"ip addr add {MGMT_CIDR} dev {self.mgmt_nic}; "
                 f"ip link set {self.mgmt_nic} up"
             )
 

@@ -16,6 +16,22 @@ config_value() {
     uci -c "$1" -q get "picot-vlan.settings.$2" 2>/dev/null || true
 }
 
+valid_ipv4() {
+    printf '%s\n' "$1" | awk -F. '
+        NF != 4 { exit 1 }
+        {
+            for (i = 1; i <= 4; i++) {
+                if ($i !~ /^[0-9]+$/ || $i + 0 > 255 ||
+                    (length($i) > 1 && substr($i, 1, 1) == "0"))
+                    exit 1
+            }
+            if ($1 == 0 || $1 == 127 || $1 >= 224)
+                exit 1
+        }
+        END { if (NR != 1) exit 1 }
+    '
+}
+
 pass_value() {
     name=$1
     pass_file=$2
@@ -59,6 +75,13 @@ validate_config() {
 
     [ "$enabled" = 1 ] || return 0
 
+    [ -r /lib/netifd/proto/vxlan.sh ] ||
+        fail "OpenWrt vxlan protocol package is missing; rebuild firmware with vxlan"
+    if [ "$role" = gateway ] &&
+        ! { [ -x /usr/sbin/bridge ] || command -v bridge >/dev/null 2>&1; }; then
+        fail "bridge command is missing; rebuild firmware with ip-bridge"
+    fi
+
     radios=$(config_value "$config_dir" radios)
     [ -n "$radios" ] || fail "enabled config must list radios"
     if printf '%s' "$radios" | grep -q '[^A-Za-z0-9_ ]'; then
@@ -91,6 +114,27 @@ validate_config() {
             fail "${network}_ssid must be printable ASCII"
         fi
     done
+
+    if [ "$role" = gateway ]; then
+        peer_ips=$(config_value "$config_dir" peer_ips)
+        [ -n "$peer_ips" ] ||
+            fail "gateway config must list edge underlay addresses in peer_ips"
+        seen_peers=' '
+        for peer in $peer_ips; do
+            valid_ipv4 "$peer" ||
+                fail "peer_ips contains an invalid unicast IPv4 address: $peer"
+            case "$seen_peers" in
+                *" $peer "*) fail "peer_ips must not contain duplicates" ;;
+            esac
+            seen_peers="$seen_peers$peer "
+        done
+    else
+        gateway_ip=$(config_value "$config_dir" gateway_ip)
+        [ -n "$gateway_ip" ] ||
+            fail "edge config must set gateway_ip to the gateway's mesh-reachable LAN address"
+        valid_ipv4 "$gateway_ip" ||
+            fail "gateway_ip must be a unicast IPv4 address"
+    fi
 }
 
 restart_services() {
@@ -128,15 +172,21 @@ restore_transaction() {
 
 remove_managed_sections() {
     for section in picot_vlan10_device picot_vlan20_device \
+        picot_vxlan_iot picot_vxlan_guest picot_vx_iot picot_vx_guest \
+        picot_vlan_iot_bridge picot_vlan_guest_bridge \
         picot_vlan_iot picot_vlan_guest \
         picot_vlan_iot_dhcp picot_vlan_guest_dhcp \
         picot_vlan_iot_dns_udp picot_vlan_iot_dns_tcp \
         picot_vlan_guest_dns_udp picot_vlan_guest_dns_tcp \
         picot_vlan_lan_to_iot picot_vlan_lan_to_guest \
-        picot_vlan_guest_to_wan; do
+        picot_vlan_guest_to_wan picot_vxlan_underlay; do
         uci -q delete "network.$section" || true
         uci -q delete "dhcp.$section" || true
         uci -q delete "firewall.$section" || true
+    done
+    for section in $(uci -q show network 2>/dev/null |
+        sed -n 's/^network\.\(picot_vxlan_peer_[A-Za-z0-9_]*\)=.*/\1/p'); do
+        uci -q delete "network.$section" || true
     done
     for radio in $(uci -q show wireless 2>/dev/null |
         sed -n "s/^wireless\\.\\(picot_vlan_\\(iot\\|guest\\)_radio[A-Za-z0-9_]*\\)=.*/\\1/p"); do
@@ -185,25 +235,55 @@ configure_network() {
 
     remove_managed_sections
 
-    for vid in 10 20; do
-        uci set "network.picot_vlan${vid}_device=device"
-        uci set "network.picot_vlan${vid}_device.name=bat0.$vid"
-        uci set "network.picot_vlan${vid}_device.type=8021q"
-        uci set "network.picot_vlan${vid}_device.ifname=bat0"
-        uci set "network.picot_vlan${vid}_device.vid=$vid"
-    done
+    uci set firewall.picot_vxlan_underlay=rule
+    uci set firewall.picot_vxlan_underlay.name=Allow-VXLAN-From-Mesh
+    uci set firewall.picot_vxlan_underlay.src=lan
+    uci set firewall.picot_vxlan_underlay.proto=udp
+    uci set firewall.picot_vxlan_underlay.dest_port=4789
+    uci set firewall.picot_vxlan_underlay.family=ipv4
+    uci set firewall.picot_vxlan_underlay.target=ACCEPT
 
     for network in iot guest; do
         if [ "$network" = iot ]; then
             vid=10
+            vni=1010
             zone=iot
         else
             vid=20
+            vni=1020
             zone=guest
         fi
 
+        tunnel="picot_vx_$network"
+        bridge="br-picot-$network"
+
+        uci set "network.$tunnel=interface"
+        uci set "network.$tunnel.proto=vxlan"
+        uci set "network.$tunnel.tunlink=lan"
+        uci set "network.$tunnel.vid=$vni"
+        uci set "network.$tunnel.port=4789"
+        uci set "network.$tunnel.mtu=1400"
+        uci set "network.$tunnel.learning=1"
+        if [ "$role" = edge ]; then
+            uci set "network.$tunnel.peeraddr=$(config_value /etc/config gateway_ip)"
+        else
+            index=0
+            for peer in $(config_value /etc/config peer_ips); do
+                index=$((index + 1))
+                section="picot_vxlan_peer_${network}_${index}"
+                uci set "network.$section=vxlan_peer"
+                uci set "network.$section.vxlan=$tunnel"
+                uci set "network.$section.dst=$peer"
+            done
+        fi
+
+        uci set "network.picot_vlan_${network}_bridge=device"
+        uci set "network.picot_vlan_${network}_bridge.name=$bridge"
+        uci set "network.picot_vlan_${network}_bridge.type=bridge"
+        uci add_list "network.picot_vlan_${network}_bridge.ports=$tunnel"
+
         uci set "network.picot_vlan_$network=interface"
-        uci set "network.picot_vlan_$network.device=bat0.$vid"
+        uci set "network.picot_vlan_$network.device=$bridge"
         if [ "$role" = gateway ]; then
             uci set "network.picot_vlan_$network.proto=static"
             uci set "network.picot_vlan_$network.ipaddr=192.168.$vid.1"

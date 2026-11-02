@@ -120,14 +120,22 @@ The requested starting point is:
 | 10 | IoT devices | `villapicot-IOT` | `192.168.10.0/24` | No WAN forwarding; main may initiate management connections |
 | 20 | Guests | `villapicot-GUEST` | `192.168.20.0/24` | WAN access; AP client isolation; main may initiate connections |
 
-The current VLAN script carries VLAN 10 and 20 as batman-adv VLAN devices
-(`bat0.10` and `bat0.20`). QEMU testing showed that DHCP and ARP-based
-reachability fail with bridge-loop avoidance enabled, so **do not enable VLANs
-on live nodes yet**. VXLAN over mesh IP is being evaluated as a replacement;
-its end-to-end transport and DHCP behavior are not verified. The intended
-gateway remains the one node whose config has `role 'gateway'`, but peer
-configuration for a replacement transport is not implemented. VLAN 30 is not
+The VLAN script transports VLAN 10 and 20 as separate VXLAN overlays (VNIs
+1010 and 1020) over the existing `lan`/`br-lan` mesh-reachable IPv4 network.
+The firmware needs the OpenWrt `vxlan` and `ip-bridge` packages; the latter
+provides gateway broadcast replication to each edge. Bridge-loop avoidance
+stays enabled. Configure the gateway with one `peer_ips` entry for every
+VLAN-enabled edge, and each edge with the gateway's mesh-reachable LAN IP as
+`gateway_ip`. The network underlay and UDP 4789 must be reachable between
+those addresses. End-to-end QEMU results and the remaining hardware limits are
+recorded in `emulator/TEST-JOURNAL.md`. Do not apply to a live node unless the
+current QEMU scenario passes and you have local recovery access. VLAN 30 is not
 created or assumed.
+
+Before configuring the overlay, check each node's underlay address with
+`ip -4 addr show dev br-lan` and verify gateway-to-edge reachability with
+`ip route get EDGE_IP` and `ping EDGE_IP`. Use stable, unique addresses on the
+existing mesh LAN; do not assign these addresses to the new VLAN bridges.
 
 VLANs are added only to radios named in that node's config. All physical
 Ethernet ports and their existing roles are left untouched and remain
@@ -193,8 +201,12 @@ python3 deploy-libremesh.py vlans \
 The command requires strict SSH host-key checking and verifies the board
 identifier. The `gateway` role is not tied to a model or hostname: choose the
 node that should serve VLAN DHCP/routing (with an uplink for guest Internet).
-For each other VLAN-enabled AP, make an edge config from `vlan-configs/edge.example`, set the proper radios, then
-use the matching device profile and SSH host.
+For each other VLAN-enabled AP, make an edge config from
+`vlan-configs/edge.example`, set the proper radios and `gateway_ip`, then use
+the matching device profile and SSH host. Add every edge's mesh-reachable LAN
+IPv4 address to the gateway config as a `list peer_ips` value. Use addresses
+that are reachable over the existing `lan` interface; do not use a client
+VLAN address or an address that changes with DHCP.
 Leave `enabled` at `0` on nodes that should continue operating as legacy-only
 nodes. This `vlans` command configures the installed firmware directly; it
 does not build or flash firmware. Only the two VLAN SSID keys are sent to the
@@ -240,9 +252,11 @@ python3 deploy-libremesh.py vlan-rollback \
 ```
 
 Do not roll out to the fleet at once. First use PICOT0 and one reachable pilot
-AP with local recovery available. Verify `bat0.10`/`bat0.20`, each new SSID,
-DHCP, guest Internet access, IoT WAN isolation, and access from the existing
-main network before confirming. The change is applied by direct UCI updates;
+AP with local recovery available. Verify `picot_vx_iot` /
+`picot_vx_guest`, `br-picot-iot` / `br-picot-guest`, each new SSID, DHCP,
+guest Internet access, IoT WAN isolation, and access from the existing main
+network before confirming. Confirm that the gateway can reach every configured
+edge underlay IP and that UDP 4789 is allowed between them. The change is applied by direct UCI updates;
 it does not invoke `lime-config`, which could regenerate LibreMesh-managed
 network or wireless sections.
 
@@ -255,14 +269,12 @@ python3 deploy-libremesh.py vlans --device aruba,ap-303 --host root@ARUBA_HOST -
 ```
 
 This uses the same timed-rollback flow and prints a `VLAN_CHANGE_ID` to
-confirm. It deletes only the `picot_vlan_*` sections (VLAN devices, VLAN
-SSIDs, DHCP/firewall entries) and leaves the main untagged network, mesh and
-Ethernet settings as they were. The node keeps interoperating with VLAN-enabled
-nodes: batman-adv still forwards their tagged VLAN 10/20 frames transparently,
-and the main network is untagged, so mixed VLAN and non-VLAN nodes stay
-connected. Clients of the removed VLAN SSIDs simply lose those SSIDs on that
-node. If an enabling change fails or is not confirmed, the automatic rollback
-returns the node to its previous state, which is non-VLAN if it had none.
+confirm. It removes only the managed VXLAN interfaces/bridges, VLAN SSIDs, and
+DHCP/firewall entries, leaving the main untagged network, mesh, and Ethernet
+settings unchanged. A node without these SSIDs continues to use the main mesh,
+but does not host the VLAN overlays. If an enabling change fails or is not
+confirmed, the automatic rollback returns the node to its previous state,
+which is non-VLAN if it had none.
 
 For rollout, enable PICOT0 first so it provides DHCP and routing, then enable
 edge APs one at a time. To retire the VLANs, disable edge APs first and PICOT0
@@ -699,14 +711,14 @@ TAP devices) intended to test the scripts on several virtual nodes:
 - the serial console is driven directly, so no extra Python packages are
   needed. `emulator/images/` and `emulator/state/` are git-ignored.
 
-Status (2026-11-01): a Firmware Selector x86/64 LibreMesh image was built and
-verified. Three-node tests passed for bidirectional pings, batman-adv
-neighbours, Babel daemon startup, and continued A-to-C connectivity after
-cutting the direct A-C link. A separate stock OpenWrt test also verified that
-cutting a link stops traffic on that segment. The Babel test checks that the
-daemon is running; it does not verify Babel-learned routes. VLAN apply,
-rollback, autowan, and real-hardware tests are still outstanding. See the
-[test journal](./emulator/TEST-JOURNAL.md) for exact results.
+Status (2026-11-02): the complete QEMU suite passes on the x86/64 LibreMesh
+image. It verifies three-node mesh and failover, VXLAN package availability,
+overlay DHCP and reachability, VLAN apply/confirm/disable, explicit rollback,
+and automatic WAN promotion/demotion. The runner uses a separate ISP topology
+for autowan to avoid a management-network collision. Run it with
+`python3 emulator/run_scenarios.py --image /path/to/openwrt-x86-64.img`.
+Automatic timeout rollback, real Wi-Fi, and router hardware behavior remain
+untested. See the [test journal](./emulator/TEST-JOURNAL.md) for exact results.
 
 The harness detaches management/mesh ports before assigning test addresses.
 Stock x86 images may bridge Ethernet ports into `br-lan`; do not assume port
