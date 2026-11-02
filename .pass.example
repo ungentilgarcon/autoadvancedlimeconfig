@@ -2,7 +2,7 @@
 # Values are plain text; do not commit .pass or paste it into chat.
 #
 # Optional shared OpenWrt root password for local --inject-pass builds.
-# Use 12-128 printable ASCII characters; blank leaves it unchanged.
+# Use 8-128 printable ASCII characters; blank leaves it unchanged.
 OPENWRT_ADMIN_PASSWORD=
 
 # Shared LibreMesh credentials used by Aruba and Redmi builds.

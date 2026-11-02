@@ -682,12 +682,12 @@ def ap_hostname_from_pass(values: dict[str, str]) -> str:
 def openwrt_admin_password_from_pass(values: dict[str, str]) -> str:
     password = values.get("OPENWRT_ADMIN_PASSWORD", "")
     if password and (
-        not 12 <= len(password) <= 128
+        not 8 <= len(password) <= 128
         or not password.isascii()
         or any(ord(char) < 32 or ord(char) > 126 for char in password)
     ):
         raise DeployError(
-            "OPENWRT_ADMIN_PASSWORD in .pass must be 12-128 printable ASCII characters"
+            "OPENWRT_ADMIN_PASSWORD in .pass must be 8-128 printable ASCII characters"
         )
     return password
 

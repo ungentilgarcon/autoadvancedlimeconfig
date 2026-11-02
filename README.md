@@ -487,7 +487,7 @@ matching ImageBuilder can be selected with `--imagebuilder-dir PATH`.
 
 Optionally set `OPENWRT_ADMIN_PASSWORD` in `.pass` to set the device's root
 password. This shared field applies to every device supported by the local
-credential-injection path. Use 12–128 printable ASCII characters; leave it
+credential-injection path. Use 8–128 printable ASCII characters; leave it
 blank to leave the root password unchanged. The build hashes it locally with
 SHA-512 crypt and embeds only the hash in the first-boot and recovery scripts.
 The plain password is not sent to Selector/ASU. This does not enable SSH
