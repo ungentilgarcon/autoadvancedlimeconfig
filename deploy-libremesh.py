@@ -1004,7 +1004,7 @@ def build_local_image(
         defaults_script.chmod(0o700)
         recovery_dir = Path(files_dir) / "usr" / "sbin"
         recovery_dir.mkdir(parents=True)
-        recovery_script = recovery_dir / "picot-wifi-configure"
+        recovery_script = recovery_dir / "autoadvancedlimeconfig-configure"
         recovery_script.write_text(
             build_lime_wifi_recovery(
                 main_key, mesh_key, hostname, admin_password_hash

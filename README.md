@@ -505,13 +505,14 @@ is available. This does not guarantee Aruba radio or Ethernet behavior, which
 still needs a device pilot.
 
 The image also includes a root-only recovery command at
-`/usr/sbin/picot-wifi-configure`. If the device boots but the first-boot
-settings did not take effect, run it from a root SSH or serial-console session.
-It asks for `APPLY`, backs up the current `lime-node`, `network`, and `wireless`
-UCI files under `/root/`, sets the same hostname and Wi-Fi/mesh settings, then
-regenerates and applies LibreMesh configuration. If an admin password is
-configured, it also backs up `/etc/shadow` and updates the root password.
-The network restart may disconnect your session; use local recovery access.
+`/usr/sbin/autoadvancedlimeconfig-configure`. If the device boots but the
+first-boot settings did not take effect, run it from a root SSH or
+serial-console session. It asks for `APPLY`, backs up the current `lime-node`,
+`network`, and `wireless` UCI files under `/root/`, sets the same hostname and
+Wi-Fi/mesh settings, then regenerates and applies LibreMesh configuration. If
+an admin password is configured, it also backs up `/etc/shadow` and updates
+the root password. The network restart may disconnect your session; use local
+recovery access.
 This recovery command is only present in the rebuilt credentialed image.
 
 The build command can optionally send a first-boot UCI-defaults script to the

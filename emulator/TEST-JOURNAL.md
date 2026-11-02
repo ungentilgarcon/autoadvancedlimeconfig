@@ -18,13 +18,16 @@
   SHA-256 is
   `e4ec0f4eb362b608711f2ecb055798c59bf908a1c4e0b6aa8576055a71c80f0f`.
   This verifies image contents and ordering, not physical AP first boot.
-- Added a root-only `/usr/sbin/picot-wifi-configure` recovery command to the
-  image. It confirms before applying, backs up current LibreMesh/network/Wi-Fi
-  UCI files, regenerates config, and restarts the network and Wi-Fi.
+- Added a root-only `/usr/sbin/autoadvancedlimeconfig-configure` recovery
+  command to the image. It confirms before applying, backs up current
+  LibreMesh/network/Wi-Fi UCI files, regenerates config, and restarts the
+  network and Wi-Fi. The rebuilt image's command matches the current generator
+  and private `.pass` byte-for-byte; the old command path is absent, mode is
+  `0700`, and shell syntax passes.
 - Both generated scripts set the earlier PICOT AP hostname template
   `PICOT-ap-%M4%M5%M6` in `lime-node.system.hostname`, as well as the Wi-Fi and
   mesh settings. Rebuilt image SHA-256:
-  `ae60d2b3bd024f13fbeb6c3a4ed2d5064617e9f7029e274a8ec5d005b976cd4a`.
+  `52cbd53c44201dc6e695737c0b14f1ba80d65fe1694511cd7cdae1e6973e72c6`.
   Physical AP behavior still requires a hardware pilot.
 - Consolidated the active Wi-Fi keys into the shared `.pass` fields
   `MAIN_WIFI_KEY` and `MESH_WIFI_KEY` for both supported device profiles, and
