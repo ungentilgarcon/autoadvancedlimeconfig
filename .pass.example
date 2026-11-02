@@ -10,11 +10,6 @@ MAIN_WIFI_KEY=
 MESH_WIFI_KEY=
 AP_HOSTNAME=PICOT-ap-%M4%M5%M6
 
-# Historical Redmi archive credentials; not used by custom image builds.
-REDMI_ARCHIVE_MAIN_WIFI_KEY=
-REDMI_ARCHIVE_APNAME_WIFI_KEY=
-REDMI_ARCHIVE_MESH_KEY=
-
 # Required by deploy-libremesh.py vlans.
 IOT_WIFI_KEY=
 GUEST_WIFI_KEY=
