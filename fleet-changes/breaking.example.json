@@ -1,0 +1,6 @@
+{
+  "kind": "config-breaking",
+  "apply": "lime",
+  "uci": ["set lime.wifi.channel_5ghz=44"],
+  "node_uci": {}
+}

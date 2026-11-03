@@ -1,0 +1,334 @@
+#!/bin/sh
+# On-node helper for fleet configuration changes (see fleet-libremesh.py).
+#
+# A change is a file of `uci batch` lines. It is validated on a scratch copy of
+# /etc/config, applied at an agreed time, and rolled back automatically by a
+# watchdog unless it is confirmed. The pending marker lives in /root so a
+# reboot during a change also rolls back (picot-config-recovery init script).
+set -u
+
+# PICOT_ROOT exists only so the script can be tested against a scratch tree.
+ROOT=${PICOT_ROOT:-}
+BASE=$ROOT/root/libremesh-failsafe
+PENDING=$BASE/cfg-pending
+SELF=${PICOT_SELF:-/usr/sbin/picot-config-sync}
+
+fail() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+valid_id() {
+    printf '%s' "$1" | grep -Eq '^[A-Za-z0-9._-]{1,40}$'
+}
+
+valid_int() {
+    printf '%s' "$1" | grep -Eq '^[0-9]{1,10}$'
+}
+
+change_dir() {
+    valid_id "$1" || fail "invalid change ID"
+    echo "$BASE/cfg-$1"
+}
+
+uptime_s() {
+    cut -d. -f1 /proc/uptime
+}
+
+set_state() {
+    echo "$2" > "$1/state"
+}
+
+# Only plain uci editing verbs are accepted; no commit/import/export.
+validate_lines() {
+    awk '
+        /^[[:space:]]*(#.*)?$/ { next }
+        $1 ~ /^(set|add|add_list|del_list|delete|rename|reorder)$/ { next }
+        { print "unsupported uci line " NR ": " $0; bad = 1 }
+        END { exit bad }
+    ' "$1" >&2
+}
+
+run_uci_batch() {
+    batch_file=$1
+    shift
+    errors=$(mktemp) || return 1
+    if uci "$@" batch < "$batch_file" >/dev/null 2>"$errors"; then
+        result=0
+    else
+        result=1
+    fi
+    if [ -s "$errors" ]; then
+        cat "$errors" >&2
+        result=1
+    fi
+    rm -f "$errors"
+    return "$result"
+}
+
+touched_packages() {
+    awk '
+        /^[[:space:]]*(#.*)?$/ { next }
+        {
+            key = $2
+            if ($1 == "add") { key = $2 }
+            sub(/^["\047]/, "", key)
+            sub(/[.=].*/, "", key)
+            print key
+        }
+    ' "$1" | sort -u
+}
+
+restart_services() {
+    /etc/init.d/network reload 9>&-
+    wifi reload 9>&-
+    /etc/init.d/firewall restart 9>&-
+    /etc/init.d/dnsmasq restart 9>&-
+    [ -x /etc/init.d/babeld ] && /etc/init.d/babeld restart 9>&-
+    return 0
+}
+
+add_sysupgrade_paths() {
+    for path in "$SELF" /etc/init.d/picot-config-recovery /root/libremesh-failsafe; do
+        grep -qxF "$path" "$ROOT/etc/sysupgrade.conf" 2>/dev/null ||
+            echo "$path" >> "$ROOT/etc/sysupgrade.conf"
+    done
+}
+
+stage_change() {
+    id=$1
+    source=$2
+    mode=$3
+    [ "$(id -u)" -eq 0 ] || fail "must run as root"
+    case "$mode" in lime|reload|none) ;; *) fail "invalid apply mode" ;; esac
+    [ -f "$source" ] || fail "change file not found"
+    [ ! -s "$PENDING" ] || fail "another change is pending: $(cat "$PENDING")"
+    dir=$(change_dir "$id")
+    validate_lines "$source" || fail "change file rejected"
+
+    scratch=$(mktemp -d)
+    trap 'rm -rf "$scratch"' EXIT HUP INT TERM
+    mkdir -p "$scratch/config" "$scratch/delta" || fail "cannot prepare scratch config"
+    cp -a "$ROOT/etc/config/." "$scratch/config/" || fail "cannot copy config for validation"
+    run_uci_batch "$source" -c "$scratch/config" -t "$scratch/delta" ||
+        fail "change does not apply cleanly to the current config"
+    rm -rf "$scratch"
+    trap - EXIT HUP INT TERM
+
+    rm -rf "$dir"
+    mkdir -p "$BASE"
+    mkdir -m 700 "$dir"
+    cp "$source" "$dir/changes.uci"
+    echo "$mode" > "$dir/mode"
+    set_state "$dir" staged
+    rm -f "$source"
+    add_sysupgrade_paths
+    echo "STAGED $(sha256sum "$dir/changes.uci" | awk '{print $1}')"
+}
+
+start_watchdog() {
+    id=$1
+    dir=$2
+    sh -c '
+        trap "" HUP
+        while :; do
+            sleep 3
+            [ -s "$1" ] && [ "$(cat "$1")" = "$2" ] || exit 0
+            now=$(cut -d. -f1 /proc/uptime)
+            if [ "$now" -ge "$(cat "$3/deadline" 2>/dev/null || echo 0)" ]; then
+                "$4" rollback-expired "$2" || exit 1
+            fi
+        done
+    ' sh "$PENDING" "$id" "$dir" "$SELF" >/dev/null 2>&1 </dev/null 9>&- &
+    echo $! > "$dir/watchdog.pid"
+}
+
+apply_now() {
+    id=$1
+    window=$2
+    dir=$(change_dir "$id")
+    valid_int "$window" || fail "invalid window"
+    [ -f "$dir/changes.uci" ] || fail "change $id is not staged"
+    case "$(cat "$dir/state" 2>/dev/null)" in
+        staged|armed) ;;
+        *) fail "change $id is not in the staged state" ;;
+    esac
+    [ ! -s "$PENDING" ] || fail "another change is pending"
+
+    tar -czf "$dir/config.tar.gz" -C "${ROOT:-/}" etc/config ||
+        fail "could not save configuration for rollback"
+    echo $(( $(uptime_s) + window )) > "$dir/deadline"
+    printf '%s\n' "$id" > "$PENDING.tmp"
+    mv -f "$PENDING.tmp" "$PENDING"
+    set_state "$dir" applying
+    start_watchdog "$id" "$dir"
+
+    if ! run_uci_batch "$dir/changes.uci"; then
+        rollback_change "$id"
+        fail "uci batch failed; rolled back"
+    fi
+    for pkg in $(touched_packages "$dir/changes.uci"); do
+        uci commit "$pkg" || { rollback_change "$id"; fail "uci commit failed; rolled back"; }
+    done
+    case "$(cat "$dir/mode")" in
+        lime)
+            lime-config 9>&- && lime-apply 9>&- ||
+                { rollback_change "$id"; fail "lime apply failed; rolled back"; }
+            ;;
+        reload)
+            reload_config 9>&- || { rollback_change "$id"; fail "reload failed; rolled back"; }
+            ;;
+    esac
+    [ -s "$PENDING" ] && [ "$(cat "$PENDING")" = "$id" ] ||
+        fail "automatic rollback expired before the change completed"
+    [ "$(uptime_s)" -lt "$(cat "$dir/deadline")" ] ||
+        { rollback_change "$id"; fail "rollback deadline expired during apply"; }
+    set_state "$dir" applied
+    echo "APPLIED $id"
+}
+
+# Wait for an epoch (this node's clock), then apply. Runs detached so a
+# dropped management connection cannot interrupt it.
+apply_at() {
+    id=$1
+    epoch=$2
+    window=$3
+    dir=$(change_dir "$id")
+    valid_int "$epoch" || fail "invalid epoch"
+    valid_int "$window" || fail "invalid window"
+    [ "$(cat "$dir/state" 2>/dev/null)" = staged ] || fail "change $id is not in the staged state"
+    now=$(date +%s)
+    [ "$epoch" -gt "$now" ] || fail "scheduled time already passed"
+    [ $(( epoch - now )) -le 900 ] || fail "scheduled time is too far away"
+    sh -c '
+        trap "" HUP
+        while [ "$(date +%s)" -lt "$1" ]; do sleep 1; done
+        exec "$2" apply-now "$3" "$4"
+    ' sh "$epoch" "$SELF" "$id" "$window" >"$dir/apply.log" 2>&1 </dev/null 9>&- &
+    echo $! > "$dir/scheduled.pid"
+    set_state "$dir" armed
+    echo "ARMED $id at $epoch"
+}
+
+cancel_change() {
+    id=$1
+    dir=$(change_dir "$id")
+    state=$(cat "$dir/state" 2>/dev/null || echo missing)
+    case "$state" in
+        armed)
+            set_state "$dir" cancelled
+            echo "CANCELLED $id"
+            ;;
+        staged)
+            set_state "$dir" cancelled
+            echo "CANCELLED $id"
+            ;;
+        *)
+            fail "cannot cancel a change in state: $state"
+            ;;
+    esac
+}
+
+confirm_change() {
+    id=$1
+    dir=$(change_dir "$id")
+    [ -s "$PENDING" ] && [ "$(cat "$PENDING")" = "$id" ] ||
+        fail "change $id is not pending"
+    [ "$(cat "$dir/state")" = applied ] || fail "change $id is not applied"
+    [ "$(uptime_s)" -lt "$(cat "$dir/deadline")" ] ||
+        fail "rollback deadline expired"
+    rm -f "$PENDING"
+    set_state "$dir" confirmed
+    echo "CONFIRMED $id"
+}
+
+extend_change() {
+    id=$1
+    seconds=$2
+    dir=$(change_dir "$id")
+    valid_int "$seconds" || fail "invalid seconds"
+    [ -s "$PENDING" ] && [ "$(cat "$PENDING")" = "$id" ] ||
+        fail "change $id is not pending"
+    [ "$(uptime_s)" -lt "$(cat "$dir/deadline")" ] ||
+        fail "rollback deadline expired"
+    echo $(( $(uptime_s) + seconds )) > "$dir/deadline"
+    echo "EXTENDED $id by $seconds"
+}
+
+rollback_change() {
+    id=$1
+    restart=${2:-yes}
+    dir=$(change_dir "$id")
+    archive=$dir/config.tar.gz
+    [ -s "$PENDING" ] && [ "$(cat "$PENDING")" = "$id" ] ||
+        fail "change $id is not pending"
+    [ -s "$archive" ] || fail "rollback archive missing"
+    tar -xzf "$archive" -C "${ROOT:-/}"
+    rm -f "$PENDING"
+    set_state "$dir" rolledback
+    [ "$restart" = yes ] && restart_services
+    echo "ROLLEDBACK $id"
+}
+
+health() {
+    peers_ok=0
+    peers_total=0
+    ok=1
+    ip link show br-lan 2>/dev/null | grep -Eq '[<,]UP[,>]' || { ok=0; echo "br_lan=down"; }
+    if [ "$(uci -q get network.bat0.proto 2>/dev/null || true)" = batadv ]; then
+        ip link show bat0 2>/dev/null | grep -Eq '[<,]UP[,>]' || { ok=0; echo "bat0=down"; }
+    fi
+    if [ -x /etc/init.d/babeld ]; then
+        pidof babeld >/dev/null 2>&1 || { ok=0; echo "babeld=stopped"; }
+    fi
+    for peer in "$@"; do
+        printf '%s' "$peer" | grep -Eq '^[0-9a-fA-F:.]{2,45}$' || continue
+        peers_total=$((peers_total + 1))
+        ping -c 2 -W 2 "$peer" >/dev/null 2>&1 && peers_ok=$((peers_ok + 1))
+    done
+    echo "peers_ok=$peers_ok"
+    echo "peers_total=$peers_total"
+    if [ "$ok" = 1 ]; then echo "health=ok"; else echo "health=fail"; fi
+}
+
+status() {
+    echo "time=$(date +%s)"
+    echo "uptime=$(uptime_s)"
+    echo "release=$(sed -n "s/^DISTRIB_DESCRIPTION='\\(.*\\)'/\\1/p" "$ROOT/etc/openwrt_release" 2>/dev/null)"
+    echo "pending=$(cat "$PENDING" 2>/dev/null || true)"
+    if [ "$#" -ge 1 ]; then
+        dir=$(change_dir "$1")
+        echo "state=$(cat "$dir/state" 2>/dev/null || echo missing)"
+    fi
+}
+
+case "${1:-}" in
+    status|health) ;;
+    *)
+        mkdir -p "$BASE" || fail "cannot create state directory"
+        command -v flock >/dev/null || fail "flock is required for safe fleet changes"
+        exec 9>"$BASE/operation.lock" || fail "cannot open fleet lock"
+        flock -x 9 || fail "cannot acquire fleet lock"
+        ;;
+esac
+
+case "${1:-}" in
+    stage) [ "$#" -eq 4 ] || fail "Usage: $0 stage ID FILE lime|reload|none"; stage_change "$2" "$3" "$4" ;;
+    apply-now) [ "$#" -eq 3 ] || fail "Usage: $0 apply-now ID WINDOW"; apply_now "$2" "$3" ;;
+    apply-at) [ "$#" -eq 4 ] || fail "Usage: $0 apply-at ID EPOCH WINDOW"; apply_at "$2" "$3" "$4" ;;
+    cancel) [ "$#" -eq 2 ] || fail "Usage: $0 cancel ID"; cancel_change "$2" ;;
+    confirm) [ "$#" -eq 2 ] || fail "Usage: $0 confirm ID"; confirm_change "$2" ;;
+    extend) [ "$#" -eq 3 ] || fail "Usage: $0 extend ID SECONDS"; extend_change "$2" "$3" ;;
+    rollback) [ "$#" -eq 2 ] || fail "Usage: $0 rollback ID"; rollback_change "$2" ;;
+    rollback-boot) [ "$#" -eq 2 ] || fail "Usage: $0 rollback-boot ID"; rollback_change "$2" no ;;
+    rollback-expired)
+        [ "$#" -eq 2 ] || fail "Usage: $0 rollback-expired ID"
+        dir=$(change_dir "$2")
+        [ -s "$PENDING" ] && [ "$(cat "$PENDING")" = "$2" ] || exit 0
+        [ "$(uptime_s)" -ge "$(cat "$dir/deadline")" ] || exit 0
+        rollback_change "$2"
+        ;;
+    health) shift; health "$@" ;;
+    status) shift; status "$@" ;;
+    *) fail "Usage: $0 {stage|apply-now|apply-at|cancel|confirm|extend|rollback|health|status}" ;;
+esac

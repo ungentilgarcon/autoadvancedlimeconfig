@@ -27,6 +27,10 @@ it on a device with a configuration rollback available.
 | File or directory | Purpose |
 |---|---|
 | `deploy-libremesh.py` | Requests Selector/ASU images, verifies SHA-256, checks device board identity, stages rollback files, tests image compatibility, and optionally starts sysupgrade. |
+| `fleet-libremesh.py` | Experimental controller for firmware and coordinated configuration changes on multiple nodes. |
+| `fleet-config-ui.py`, `fleet_archive.py` | Local backup comparison, per-node dry run, and experimental staged fleet deployment. |
+| `picot-config-sync`, `picot-config-recovery` | On-node configuration staging, timed rollback, and boot recovery helpers installed by the fleet controller. |
+| `fleet-inventory.example.json`, `fleet-changes/*.example.json` | Illustrative fleet inventory and change templates; replace values before use. |
 | `restore-libremesh-config.sh` | On-device interactive restore for the saved PICOT0 config or the device's captured pre-upgrade config. |
 | `apply-libremesh-vlans.sh` | Applies or removes managed VLAN UCI sections on a device with a timed rollback and explicit confirmation. |
 | `picot-vlan-recovery` | Boot-time recovery hook; restores a pending transaction before network startup if the node reboots. |
@@ -759,6 +763,178 @@ Try the local Ethernet management address and wait for mesh convergence. If
 the device does not boot or cannot be reached, use local/serial recovery. The
 configuration restore command is not a substitute for firmware recovery.
 
+## Fleet upgrades (experimental)
+
+### Backup comparison and fleet deployment
+
+Run `python3 fleet-config-ui.py` on the controller and open the printed local
+URL. Upload an original router backup and an edited copy, and/or enter
+comma-separated package names. The page lists changed regular files under
+`/etc`, `/usr/sbin` and `/opt`, their permissions, and line counts without
+displaying file contents. To review a new tool, add it under `usr/sbin/` or
+`opt/` in the edited archive and set its executable permissions before
+repacking. Other paths, including `/usr/bin`, are not included. OpenWrt backups
+do not necessarily contain `/usr/sbin` or `/opt` by default. Backups remain in
+the local process/browser memory and are not written into the repository.
+The URL contains an access token; do not share it. The interface listens only
+on `127.0.0.1`.
+
+Select files and/or packages and an inventory, then choose **Dry run against
+nodes**. Backups are optional for package-only deployments. The dry run fetches
+current files over SSH and checks whether each change can be merged without
+overwriting per-node differences. Every node needs a valid, distinct `mesh_ip`.
+Changed symlinks and special files are rejected.
+
+The dry run detects `apk` (OpenWrt 25.12+) or `opkg` on each node. APK
+simulates dependency resolution against cached indexes; OPKG checks requested
+package metadata only, **not dependencies**, because its no-action install
+cannot reliably simulate a new download. Update indexes beforehand using
+`apk update` or `opkg update` on each node if necessary. The dry run does not
+install packages, validate UCI syntax, check connectivity to repositories, or
+check node health.
+
+After a successful dry run, choose **Deploy selected changes** and type
+`DEPLOY` to confirm. The controller checks package availability and node
+health, installs requested packages sequentially, stages files on every node,
+then schedules the rollout. Target files are checked again before apply;
+stale files abort the change. The nodes must have `flock`, and the current
+file and UCI helpers serialize operations using a shared lock. Do not run
+older controller/helper versions concurrently. Changes under `/etc/config`
+are checked for UCI syntax during staging, not during the dry run.
+
+**Package installation is not rolled back**, including dependencies, upgrades
+and package scripts. A failure or timeout may leave a partially installed or
+still-running operation; the error identifies attempted and completed nodes.
+Package scripts can change configuration or connectivity before file staging.
+If they change a selected file, staging rejects the stale preimage; run a new
+dry run after examining the node.
+
+Files retain their selected modes; modifications also preserve the existing
+node's ownership. A watchdog and boot recovery restore pending, unconfirmed
+changes. Scheduling and confirmation are **best effort, not atomic**: a
+partial confirmation or an unreachable node can leave different states and
+require manual recovery. Health checks require peer pings and, where its init
+script exists, Babel; they do not prove routing convergence or validate a
+different routing protocol. `Reload configuration` calls OpenWrt
+`reload_config`; `Write files only` requires separate activation as needed.
+The helper retains staged files and rollback snapshots on each node under
+root-only `/root/libremesh-failsafe`; treat them as sensitive.
+
+Three isolated QEMU nodes passed deployment, stale-target, locking, watchdog
+and reboot-recovery scenarios. A mixed APK/OPKG QEMU fleet passed package-only,
+combined and partial-failure tests. This does not prove safety on physical
+devices. The separate UCI-only controller
+rolls back `/etc/config`, not arbitrary files under `/etc`, `/usr/sbin` or
+`/opt`.
+
+**Do not use this controller on a production fleet without a successful
+hardware pilot and independent recovery access to every node.** QEMU cannot
+prove real Wi-Fi connectivity, firmware recovery, or atomic fleet-wide
+changes. Keep a verified configuration backup and a local/serial recovery
+path. In particular, automatic firmware rollback is not provided.
+
+The controller supports:
+
+- `firmware`: build or supply one image per device profile, then upgrade
+  nodes sequentially with `sysupgrade -c`, checking health and stopping on
+  failure. Canary nodes go first, ordinary nodes next, and gateways last
+  (do not mark a gateway as a canary if it must remain last).
+- `config-safe`: stage UCI changes on all affected nodes, then apply and
+  confirm each node sequentially with a timed rollback. An allowlist guard
+  is only a heuristic, not proof that a change cannot disrupt connectivity.
+- `config-breaking`: stage on all affected nodes, measure clock offsets, arm
+  a scheduled apply, and check health before confirming. This is
+  **best-effort synchronization, not an atomic transaction**. Failures
+  during arming or confirmation can result in different node states; check
+  every node and be ready to recover it locally.
+
+### Prepare an inventory and access
+
+Copy `fleet-inventory.example.json` to `fleet-inventory.json` and edit the
+copy. Each node needs a unique `name` and SSH `host`; specify the exact
+OpenWrt `device` profile for firmware upgrades, `role` (`node` or `gateway`),
+optional `canary`, and a reachable `mesh_ip` for peer checks. Obtain device
+profile IDs with `python3 deploy-libremesh.py build --list-devices`.
+Missing `mesh_ip` values are omitted from checks, so include one for **every**
+node if peer reachability matters. The controller checks only the selected
+inventory nodes and only applies a change to nodes with UCI lines.
+
+Configure SSH keys and verify each host key beforehand; strict host-key
+checking is enabled. If SSH passwords are needed, copy `.pass.example` to
+`.pass`, make it mode 600, and set `FLEET_SSH_PASSWORD` or the per-node
+`FLEET_SSH_PASSWORD_<NODE>` override. The suffix is the node name uppercased
+with non-alphanumeric characters replaced by underscores. Password-based
+SSH requires `sshpass`; otherwise SSH keys are used. Firmware board checks
+currently use the deploy tool's key-based SSH path even when a fleet password
+is configured, so password-only firmware access is not supported.
+
+`.pass` is not interpolated into UCI change files: if a configuration change
+needs a secret, arrange it privately and protect the change file itself.
+Dry-run prints UCI lines, and validation errors can print them too; avoid
+exposing terminal output. Git ignores the default `fleet-inventory.json`,
+non-example files directly under `fleet-changes/`, `fleet-backups/`,
+`fleet-logs/`, and `firmware-output/`. **Other paths and names are not
+automatically private.** Use `git check-ignore -v PATH`, verify `git status`
+before committing, and protect backups and custom paths separately. Set
+`umask 077` before creating private files or running backups; Git ignore is
+not access control.
+
+### Configuration changes
+
+Copy an example to an ignored name, for example
+`cp fleet-changes/safe.example.json fleet-changes/my-change.json`, then edit
+it for the actual nodes. Change JSON contains `kind`, an `apply` mode
+(`lime`, `reload`, or `none`), a common `uci` list of UCI batch commands,
+and optionally `node_uci`, mapping node names to additional command lists.
+`lime` runs `lime-config` and `lime-apply`; `reload` invokes
+`reload_config`; `none` only commits UCI changes. Select the appropriate
+mode and verify the resulting services; examples are not production
+configuration.
+
+```sh
+python3 fleet-libremesh.py backup
+python3 fleet-libremesh.py config fleet-changes/my-change.json --dry-run
+python3 fleet-libremesh.py config fleet-changes/my-change.json --id change-001
+python3 fleet-libremesh.py status
+```
+
+By default the controller reads `fleet-inventory.json` in the current
+directory; use `--inventory PATH` to select another. Repeat `--node NAME` to
+limit a command, but doing so excludes other nodes from the staging and
+health gates. `--window` sets the rollback timeout (default 600 seconds);
+`--lead` sets the breaking-change scheduling delay (default 45 seconds).
+`--force` bypasses preflight health failures and `--no-safety-guard` bypasses
+the safe-change guard; neither makes a change safe.
+
+On each affected node the controller installs `picot-config-sync` and enables
+`picot-config-recovery`. A staged change is tested against a scratch copy of
+UCI configuration. Before applying, the node saves `/etc/config` under
+`/root/libremesh-failsafe/`; a watchdog restores it if the change is not
+confirmed before its deadline, and the recovery hook attempts restoration
+on reboot. Snapshots contain secrets. A pending change can be rolled back
+with `python3 fleet-libremesh.py rollback change-001` or, locally on a node,
+`/usr/sbin/picot-config-sync rollback change-001`. Rollback only works while
+the change is pending, not after confirmation. A partial confirmation may
+leave confirmed nodes on the new config while other nodes revert; inspect
+all nodes and use local recovery as needed.
+
+### Firmware
+
+```sh
+python3 fleet-libremesh.py firmware --dry-run
+python3 fleet-libremesh.py firmware --version VERSION
+# Or provide an image for every selected profile:
+python3 fleet-libremesh.py firmware --image 'DEVICE=/private/path/image.bin'
+```
+
+The controller asks for an explicit fleet confirmation, tests each uploaded
+image using `sysupgrade -T`, and stops when a node fails its checks. It
+preserves configuration via `sysupgrade -c`; this does not guarantee that an
+old configuration works with a new firmware release. Firmware may not be
+recoverable automatically. Test the exact board, image, SSH access and
+restore procedure on a pilot first. The backup command saves only
+`/etc/config`; it is not a full firmware backup.
+
 ## Emulator testbed (experimental)
 
 `emulator/lime_testbed.py` is an unprivileged QEMU/KVM harness (no root, no
@@ -774,18 +950,45 @@ TAP devices) intended to test the scripts on several virtual nodes:
 - the serial console is driven directly, so no extra Python packages are
   needed. `emulator/images/` and `emulator/state/` are git-ignored.
 
-Status (2026-11-02): the complete QEMU suite passes on the x86/64 LibreMesh
-image. It verifies three-node mesh and failover, VXLAN package availability,
-overlay DHCP and reachability, VLAN apply/confirm/disable, explicit rollback,
-and automatic WAN promotion/demotion. The runner uses a separate ISP topology
-for autowan to avoid a management-network collision. Run it with
+The earlier QEMU suite reported passes for three-node mesh and failover,
+overlay reachability, VLAN apply/confirm/disable, explicit rollback, and
+automatic WAN promotion/demotion. **The reported ping-based mesh and
+reachability results are not reliable:** several checks suppress ping output
+and then check for empty output without checking the exit status. They must be
+rerun with corrected assertions before claiming connectivity or failover.
+The runner uses a separate ISP topology for autowan to avoid a
+management-network collision. Run it with
 `python3 emulator/run_scenarios.py --image /path/to/openwrt-x86-64.img`.
-Automatic timeout rollback, real Wi-Fi, and router hardware behavior remain
-untested. See the [test journal](./emulator/TEST-JOURNAL.md) for exact results.
+That older suite did not test automatic timeout rollback, real Wi-Fi, or
+router hardware behavior. See the [test journal](./emulator/TEST-JOURNAL.md)
+for exact results.
+
+The fleet-specific runners use isolated VM disks and SSH state:
+
+```sh
+python3 emulator/run_fleet_scenarios.py --image /path/to/libremesh-x86.img
+python3 emulator/run_fleet_file_scenarios.py --image /path/to/libremesh-x86.img
+python3 emulator/run_fleet_package_scenarios.py \
+  --apk-image /path/to/libremesh-25.12-x86.img \
+  --opkg-image /path/to/openwrt-24.10-x86.img
+```
+
+The package test downloads package indexes and installs packages in the
+disposable VMs; it requires internet access. These tests do not establish
+physical radio behavior or atomic fleet-wide deployment.
 
 The harness detaches management/mesh ports before assigning test addresses.
 Stock x86 images may bridge Ethernet ports into `br-lan`; do not assume port
 roles from their names.
+
+For the fleet controller, run
+`python3 emulator/run_fleet_scenarios.py --image /path/to/openwrt-x86-64.img`
+with a raw LibreMesh image. This separate three-node test uses isolated SSH
+state and verifies peer pings, a safe change, a scheduled change, rejection
+of an invalid UCI command, and watchdog rollback. The scheduled change uses
+`apply: none` and does not actually disrupt connectivity. It does not test
+firmware flashing, boot-time recovery, a failed arming or confirmation, or
+real hardware. See the [test journal](./emulator/TEST-JOURNAL.md) for results.
 
 Limits: there is no QEMU machine for the Aruba's IPQ40xx SoC, so the emulator
 cannot reproduce ath10k/mt7915 radios, real Wi-Fi mesh, DSA/switch port

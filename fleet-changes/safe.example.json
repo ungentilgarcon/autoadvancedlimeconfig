@@ -1,0 +1,5 @@
+{
+  "kind": "config-safe",
+  "apply": "reload",
+  "uci": ["set system.@system[0].log_size=256"]
+}

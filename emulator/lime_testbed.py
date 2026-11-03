@@ -226,6 +226,7 @@ class VM:
         self.rundir = rundir
         self.memory = memory
         self.ssh_port = ssh_port
+        self.allow_reboot = False
         self._mgmt_nic: str | None = None
         self.process: subprocess.Popen | None = None
         self.serial_path = rundir / f"{name}.serial"
@@ -248,11 +249,12 @@ class VM:
         args = [
             "qemu-system-x86_64", "-enable-kvm", "-cpu", "host", "-M", "pc",
             "-m", str(self.memory), "-smp", "1", "-display", "none",
-            "-no-reboot",
             "-drive", f"file={self.disk},if=virtio,format=qcow2",
             "-serial", f"unix:{self.serial_path},server=on,wait=off",
             "-monitor", f"unix:{self.monitor_path},server=on,wait=off",
         ]
+        if not self.allow_reboot:
+            args.append("-no-reboot")
         for nic, link in enumerate(self.links):
             port_path = self.rundir / f"{self.name}-eth{nic}.sock"
             port_path.unlink(missing_ok=True)

@@ -1088,14 +1088,19 @@ def build_local_image(
 
     target_name, subtarget = device["target"].split("/", 1)
     image_dir = builder / "bin" / "targets" / target_name / subtarget
-    candidates = sorted(image_dir.glob(f"*{device['profile']}*sysupgrade.bin"))
+    candidates = sorted(
+        path
+        for path in image_dir.glob(f"*{device['profile']}*sysupgrade.*")
+        if path.suffix in (".bin", ".itb")
+    )
     if len(candidates) != 1:
         raise DeployError(
             f"Expected one local sysupgrade image for {device['profile']}, "
             f"found {len(candidates)} in {image_dir}"
         )
     image_name = candidates[0].name
-    output = output_dir / f"{image_name.removesuffix('.bin')}-with-pass.bin"
+    suffix = candidates[0].suffix
+    output = output_dir / f"{image_name.removesuffix(suffix)}-with-pass{suffix}"
     temporary = output.with_suffix(output.suffix + ".part")
     shutil.copyfile(candidates[0], temporary)
     temporary.chmod(0o600)

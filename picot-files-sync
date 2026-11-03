@@ -1,0 +1,320 @@
+#!/bin/sh
+# Transactional file updates staged by fleet_file_deploy.py.
+set -u
+umask 077
+
+BASE=/root/libremesh-failsafe
+PENDING=$BASE/cfg-pending
+SELF=/usr/sbin/picot-files-sync
+
+fail() { echo "ERROR: $*" >&2; exit 1; }
+valid_id() { printf '%s' "$1" | grep -Eq '^[A-Za-z0-9._-]{1,40}$'; }
+valid_number() { printf '%s' "$1" | grep -Eq '^[0-9]{1,10}$'; }
+directory() { valid_id "$1" || fail "invalid change ID"; echo "$BASE/files-$1"; }
+state() { printf '%s\n' "$2" > "$1/state"; }
+
+run_reload() {
+    limit=$1
+    reload_config 9>&- &
+    reload_pid=$!
+    while kill -0 "$reload_pid" 2>/dev/null; do
+        if [ "$(cut -d. -f1 /proc/uptime)" -ge "$limit" ]; then
+            kill -KILL "$reload_pid" 2>/dev/null || true
+            wait "$reload_pid" 2>/dev/null || true
+            return 1
+        fi
+        sleep 1
+    done
+    wait "$reload_pid"
+}
+
+check_path() (
+    relative=$1
+    printf '%s' "$relative" | grep -Eq '^(etc/|opt/|usr/sbin/)[A-Za-z0-9_+@./-]+$' ||
+        fail "invalid target path"
+    case "/$relative/" in *"/../"*|*"/./"*|*"//"*) fail "invalid target path" ;; esac
+    current=
+    oldifs=$IFS
+    IFS=/
+    set -f
+    for component in $relative; do
+        current=$current/$component
+        [ ! -L "$current" ] || fail "symlink in target path: $relative"
+    done
+    set +f
+    IFS=$oldifs
+)
+
+validate() (
+    dir=$1
+    [ -s "$dir/manifest" ] || fail "missing manifest"
+    awk -F'|' 'NF != 6 || seen[$2]++ { exit 1 }' "$dir/manifest" ||
+        fail "invalid or duplicate manifest entry"
+    while IFS='|' read -r operation path before before_mode after after_mode extra; do
+        [ -z "$extra" ] || fail "invalid manifest"
+        case "$operation" in add|modify|delete) ;; *) fail "invalid operation" ;; esac
+        check_path "$path" || fail "unsafe target path"
+        case "$before" in
+            -) [ ! -e "/$path" ] || fail "target already exists: $path" ;;
+            *)
+                printf '%s' "$before" | grep -Eq '^[0-9a-f]{64}$' || fail "invalid checksum"
+                printf '%s' "$before_mode" | grep -Eq '^[0-7]{1,4}$' || fail "invalid mode"
+                [ -f "/$path" ] || fail "target is not a regular file: $path"
+                actual=$(sha256sum "/$path" | cut -d' ' -f1)
+                mode_file=$(mktemp) || fail "cannot check mode"
+                chmod "$before_mode" "$mode_file" || fail "cannot check mode"
+                expected_mode=$(ls -ldn "$mode_file" | cut -c1-10)
+                actual_mode=$(ls -ldn "/$path" | cut -c1-10)
+                rm -f "$mode_file"
+                [ "$actual" = "$before" ] && [ "$actual_mode" = "$expected_mode" ] ||
+                    fail "target changed since preflight: $path"
+                ;;
+        esac
+        case "$operation" in
+            add) [ "$before" = - ] && [ "$before_mode" = - ] || fail "invalid addition" ;;
+            modify) [ "$before" != - ] || fail "invalid modification" ;;
+            delete) [ "$before" != - ] && [ "$after" = - ] && [ "$after_mode" = - ] ||
+                fail "invalid deletion" ;;
+        esac
+        if [ "$operation" != delete ]; then
+            printf '%s' "$after" | grep -Eq '^[0-9a-f]{64}$' || fail "invalid payload checksum"
+            printf '%s' "$after_mode" | grep -Eq '^[0-7]{1,4}$' || fail "invalid payload mode"
+            [ -f "$dir/data-$after" ] && [ ! -L "$dir/data-$after" ] ||
+                fail "missing payload"
+            actual=$(sha256sum "$dir/data-$after" | cut -d' ' -f1)
+            [ "$actual" = "$after" ] || fail "payload checksum mismatch"
+        fi
+    done < "$dir/manifest"
+)
+
+validate_uci() (
+    dir=$1
+    scratch=$(mktemp -d) || fail "cannot create validation directory"
+    trap 'rm -rf "$scratch"' EXIT HUP INT TERM
+    mkdir "$scratch/config" "$scratch/delta" || fail "cannot create validation directories"
+    cp -a /etc/config/. "$scratch/config/" || fail "cannot copy UCI configuration"
+    while IFS='|' read -r operation path before before_mode after after_mode extra; do
+        case "$path" in
+            etc/config/*)
+                package=${path#etc/config/}
+                printf '%s' "$package" | grep -Eq '^[A-Za-z0-9_-]+$' ||
+                    fail "invalid UCI package path: $path"
+                if [ "$operation" = delete ]; then
+                    rm -f "$scratch/config/$package" || fail "cannot validate $path"
+                else
+                    cp "$dir/data-$after" "$scratch/config/$package" ||
+                        fail "cannot validate $path"
+                fi
+                ;;
+        esac
+    done < "$dir/manifest"
+    while IFS='|' read -r operation path before before_mode after after_mode extra; do
+        case "$path" in
+            etc/config/*)
+                [ "$operation" = delete ] && continue
+                package=${path#etc/config/}
+                uci -c "$scratch/config" -t "$scratch/delta" show "$package" \
+                    > /dev/null 2> "$scratch/error" || fail "invalid UCI file: $path"
+                [ ! -s "$scratch/error" ] || fail "invalid UCI file: $path"
+                ;;
+        esac
+    done < "$dir/manifest"
+)
+
+stage() {
+    id=$1
+    source=$2
+    mode=$3
+    [ "$(id -u)" -eq 0 ] || fail "must run as root"
+    case "$mode" in none|reload) ;; *) fail "invalid apply mode" ;; esac
+    [ "$source" = "/tmp/picot-files-$id" ] || fail "invalid upload directory"
+    [ -d "$source" ] && [ ! -L "$source" ] || fail "missing upload directory"
+    [ ! -s "$PENDING" ] || fail "another change is pending"
+    dir=$(directory "$id")
+    [ ! -e "$dir" ] || fail "change ID already exists"
+    mkdir -p "$BASE" || fail "cannot create state directory"
+    validate "$source" || fail "file validation failed"
+    validate_uci "$source" || fail "UCI validation failed"
+    mv "$source" "$dir" || fail "cannot stage change"
+    printf '%s\n' "$mode" > "$dir/mode"
+    for path in "$SELF" /usr/sbin/picot-config-sync /etc/init.d/picot-config-recovery "$BASE"; do
+        grep -qxF "$path" /etc/sysupgrade.conf 2>/dev/null ||
+            echo "$path" >> /etc/sysupgrade.conf || fail "cannot update sysupgrade.conf"
+    done
+    state "$dir" staged
+    echo "STAGED $id"
+}
+
+watchdog() {
+    id=$1
+    dir=$2
+    sh -c '
+        trap "" HUP
+        while :; do
+            sleep 3
+            [ -s "$1" ] && [ "$(cat "$1")" = "files:$2" ] || exit 0
+            now=$(cut -d. -f1 /proc/uptime)
+            if [ "$now" -ge "$(cat "$3/deadline")" ]; then
+                "$4" rollback-expired "$2" || exit 1
+            fi
+        done
+    ' sh "$PENDING" "$id" "$dir" "$SELF" >"$dir/watchdog.log" 2>&1 </dev/null 9>&- &
+}
+
+apply_now() {
+    id=$1
+    window=$2
+    dir=$(directory "$id")
+    valid_number "$window" && [ "$window" -gt 0 ] || fail "invalid rollback window"
+    case "$(cat "$dir/state" 2>/dev/null)" in staged|armed) ;; *) fail "not staged" ;; esac
+    [ ! -s "$PENDING" ] || fail "another change is pending"
+    validate "$dir" || fail "file validation failed"
+    mkdir "$dir/backup" || fail "cannot create backup"
+    index=0
+    while IFS='|' read -r operation path before before_mode after after_mode extra; do
+        index=$((index + 1))
+        if [ "$before" != - ]; then
+            cp -p "/$path" "$dir/backup/$index" || fail "cannot snapshot $path"
+        fi
+    done < "$dir/manifest"
+    echo $(( $(cut -d. -f1 /proc/uptime) + window )) > "$dir/deadline"
+    printf 'files:%s\n' "$id" > "$PENDING.tmp" || fail "cannot write pending marker"
+    mv "$PENDING.tmp" "$PENDING" || fail "cannot save pending marker"
+    state "$dir" applying
+    watchdog "$id" "$dir"
+    while IFS='|' read -r operation path before before_mode after after_mode extra; do
+        check_path "$path" || { rollback "$id"; fail "unsafe target path"; }
+        if [ "$operation" = delete ]; then
+            rm -f "/$path" || { rollback "$id"; fail "cannot delete $path"; }
+        else
+            parent=$(dirname "/$path")
+            mkdir -p "$parent" || { rollback "$id"; fail "cannot create $parent"; }
+            tmp=$(mktemp "$parent/.picot-$id.XXXXXX") ||
+                { rollback "$id"; fail "cannot create temporary file"; }
+            if { [ "$before" != - ] && ! cp -p "/$path" "$tmp"; } ||
+               ! cat "$dir/data-$after" > "$tmp" || ! chmod "$after_mode" "$tmp" ||
+               ! mv -f "$tmp" "/$path"; then
+                rm -f "$tmp"
+                rollback "$id"
+                fail "cannot apply $path"
+            fi
+        fi
+    done < "$dir/manifest"
+    if [ "$(cat "$dir/mode")" = reload ]; then
+        run_reload "$(cat "$dir/deadline")" || { rollback "$id"; fail "reload failed"; }
+    fi
+    [ -s "$PENDING" ] && [ "$(cat "$PENDING")" = "files:$id" ] ||
+        fail "automatic rollback expired before apply completed"
+    [ "$(cut -d. -f1 /proc/uptime)" -lt "$(cat "$dir/deadline")" ] ||
+        { rollback "$id"; fail "rollback deadline expired during apply"; }
+    state "$dir" applied
+    echo "APPLIED $id"
+}
+
+apply_at() {
+    id=$1
+    epoch=$2
+    window=$3
+    dir=$(directory "$id")
+    valid_number "$epoch" && valid_number "$window" && [ "$window" -gt 0 ] ||
+        fail "invalid schedule"
+    [ "$(cat "$dir/state" 2>/dev/null)" = staged ] || fail "not staged"
+    now=$(date +%s)
+    [ "$epoch" -gt "$now" ] && [ $((epoch - now)) -le 900 ] || fail "invalid apply time"
+    state "$dir" armed
+    sh -c '
+        trap "" HUP
+        while [ "$(date +%s)" -lt "$1" ]; do sleep 1; done
+        exec "$2" apply-now "$3" "$4"
+    ' sh "$epoch" "$SELF" "$id" "$window" >"$dir/apply.log" 2>&1 </dev/null 9>&- &
+    echo $! > "$dir/scheduled.pid"
+    echo "ARMED $id"
+}
+
+rollback() {
+    id=$1
+    restart=${2:-yes}
+    dir=$(directory "$id")
+    [ -s "$PENDING" ] && [ "$(cat "$PENDING")" = "files:$id" ] || fail "not pending"
+    [ -d "$dir/backup" ] || fail "missing backup"
+    index=0
+    while IFS='|' read -r operation path before before_mode after after_mode extra; do
+        index=$((index + 1))
+        check_path "$path" || fail "unsafe target path"
+        if [ "$before" = - ]; then
+            rm -f "/$path" || fail "cannot remove added file: $path"
+        else
+            [ -f "$dir/backup/$index" ] || fail "missing backup for $path"
+            mkdir -p "$(dirname "/$path")" || fail "cannot restore parent"
+            cp -p "$dir/backup/$index" "/$path" || fail "cannot restore $path"
+        fi
+    done < "$dir/manifest"
+    if [ "$restart" = yes ] && [ "$(cat "$dir/mode")" = reload ]; then
+        run_reload "$(( $(cut -d. -f1 /proc/uptime) + 60 ))" ||
+            fail "restored files but reload failed"
+    fi
+    rm -f "$PENDING"
+    state "$dir" rolledback
+    echo "ROLLEDBACK $id"
+}
+
+case "${1:-}" in
+    status) ;;
+    *)
+        mkdir -p "$BASE" || fail "cannot create state directory"
+        command -v flock >/dev/null || fail "flock is required for safe fleet changes"
+        exec 9>"$BASE/operation.lock" || fail "cannot open fleet lock"
+        flock -x 9 || fail "cannot acquire fleet lock"
+        ;;
+esac
+
+case "${1:-}" in
+    stage) [ "$#" -eq 4 ] || fail "stage ID DIR MODE"; stage "$2" "$3" "$4" ;;
+    apply-now) [ "$#" -eq 3 ] || fail "apply-now ID WINDOW"; apply_now "$2" "$3" ;;
+    apply-at) [ "$#" -eq 4 ] || fail "apply-at ID EPOCH WINDOW"; apply_at "$2" "$3" "$4" ;;
+    rollback) [ "$#" -eq 2 ] || fail "rollback ID"; rollback "$2" ;;
+    rollback-boot) [ "$#" -eq 2 ] || fail "rollback-boot ID"; rollback "$2" no ;;
+    rollback-expired)
+        [ "$#" -eq 2 ] || fail "rollback-expired ID"
+        dir=$(directory "$2")
+        [ -s "$PENDING" ] && [ "$(cat "$PENDING")" = "files:$2" ] || exit 0
+        [ "$(cut -d. -f1 /proc/uptime)" -ge "$(cat "$dir/deadline")" ] || exit 0
+        rollback "$2"
+        ;;
+    status)
+        [ "$#" -eq 2 ] || fail "status ID"
+        dir=$(directory "$2")
+        echo "state=$(cat "$dir/state" 2>/dev/null || echo missing)"
+        echo "pending=$(cat "$PENDING" 2>/dev/null || true)"
+        ;;
+    confirm)
+        [ "$#" -eq 2 ] || fail "confirm ID"
+        dir=$(directory "$2")
+        [ -s "$PENDING" ] && [ "$(cat "$PENDING")" = "files:$2" ] || fail "not pending"
+        [ "$(cat "$dir/state")" = applied ] || fail "change is not applied"
+        [ "$(cut -d. -f1 /proc/uptime)" -lt "$(cat "$dir/deadline")" ] ||
+            fail "rollback deadline expired"
+        rm -f "$PENDING"; state "$dir" confirmed; echo "CONFIRMED $2"
+        ;;
+    extend)
+        [ "$#" -eq 3 ] || fail "extend ID WINDOW"
+        valid_number "$3" && [ "$3" -gt 0 ] || fail "invalid window"
+        dir=$(directory "$2")
+        [ -s "$PENDING" ] && [ "$(cat "$PENDING")" = "files:$2" ] || fail "not pending"
+        [ "$(cut -d. -f1 /proc/uptime)" -lt "$(cat "$dir/deadline")" ] ||
+            fail "rollback deadline expired"
+        echo $(( $(cut -d. -f1 /proc/uptime) + $3 )) > "$dir/deadline"
+        echo "EXTENDED $2"
+        ;;
+    cancel)
+        [ "$#" -eq 2 ] || fail "cancel ID"
+        dir=$(directory "$2")
+        case "$(cat "$dir/state" 2>/dev/null)" in
+            staged) state "$dir" cancelled ;;
+            armed) state "$dir" cancelled ;;
+            *) fail "cannot cancel this change" ;;
+        esac
+        echo "CANCELLED $2"
+        ;;
+    *) fail "unsupported command" ;;
+esac

@@ -1,0 +1,7 @@
+{
+  "nodes": [
+    {"name": "redmi-1", "host": "root@10.13.0.1", "device": "xiaomi_redmi-router-ax6000-ubootmod", "role": "gateway", "mesh_ip": "10.13.0.1"},
+    {"name": "aruba-1", "host": "root@10.13.0.2", "device": "aruba_ap-303", "canary": true, "mesh_ip": "10.13.0.2"},
+    {"name": "aruba-2", "host": "root@10.13.0.3", "device": "aruba_ap-303", "mesh_ip": "10.13.0.3"}
+  ]
+}

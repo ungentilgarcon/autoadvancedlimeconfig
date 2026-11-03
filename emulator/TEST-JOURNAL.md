@@ -1,5 +1,81 @@
 # Emulator test journal
 
+## 2026-11-03: APK and OPKG UI deployment
+
+- Exercised a mixed two-node QEMU fleet using LibreMesh/OpenWrt 25.12 APK and
+  OpenWrt 24.10 OPKG. After updating package indexes, a dry run did not change
+  the package databases or install the requested package. Package-and-file
+  deployment and package-only deployment both installed real packages.
+- A deliberately unreachable OPKG feed caused the second node to fail after
+  the first node installed its package. The UI reported the partial outcome,
+  did not deploy files, and succeeded after restoring the feed and rerunning
+  the dry run. No physical devices were contacted.
+- OPKG `--noaction install` attempted a download and failed even though the
+  package was available. Its dry-run check therefore verifies requested
+  package metadata only, not dependency resolution. APK uses its simulation.
+
+## 2026-11-03: UI file deployment enabled
+
+- The normal UI endpoint was exercised on three isolated VMs. Dry run and
+  confirmation, node-specific merges, executable files, stale-target rejection,
+  watchdog rollback, cancellation, competing UCI/file operations, deadline
+  extension and reboot recovery passed. Modified-file ownership and modes
+  were checked. No physical devices were contacted.
+- The separate UCI fleet scenarios also passed with shared locking. This does
+  not establish atomic confirmation, routing-protocol convergence or physical
+  radio behavior; package installation was not implemented at the time.
+
+## 2026-11-03: experimental archive file rollout
+
+- Ran `python3 emulator/run_fleet_file_scenarios.py --image emulator/images/lime.img`
+  on three isolated LibreMesh x86/64 VMs. The harness explicitly enables an
+  then-disabled experimental deployment endpoint; no physical nodes were
+  contacted.
+- The dry run left files unchanged, and deployment without the exact
+  confirmation was rejected. A staged rollout preserved node-specific UCI
+  values and installed executable files under `/usr/sbin` and `/opt`.
+- Changing a node's target file after dry run aborted staging without
+  overwriting any node. On one VM, the watchdog restored a modified file and
+  its mode, restored a deleted file, and removed an added file.
+- QEMU exposed missing `stat`/`base64` utilities and, more importantly,
+  ignored staging validation failures. The helper now uses available
+  utilities and propagates validation failures; the scenario passed after
+  these fixes.
+- These tests do not establish safe concurrency between apply and rollback,
+  cross-controller locking, boot recovery, network-breaking changes, or
+  partial confirmation behavior. The normal UI deployment endpoint was
+  disabled at the time, and package installation was not implemented.
+
+## 2026-11-03: correction to earlier ping results
+
+Several checks in `run_scenarios.py` run ping with output redirected and
+`check=False`, then treat empty output as success. A failed ping can therefore
+be reported as a pass. Earlier claims below about mesh ping, failover and
+overlay reachability based on those checks are not verified; rerun them with
+exit-status-aware assertions. Other observations are not automatically
+validated by this correction.
+
+### Fleet configuration test
+
+- Ran `python3 emulator/run_fleet_scenarios.py --image emulator/images/lime.img`
+  on three x86/64 LibreMesh VMs with a shared emulated mesh link. The runner
+  uses isolated disks and SSH state; no physical nodes were changed.
+- Verified two-packet peer reachability in both directions, sequential
+  `config-safe` application and confirmation, scheduled `config-breaking`
+  application and confirmation on all three nodes, rejection on one node
+  without applying or leaking UCI deltas to any node, and restoration by the
+  watchdog after its eight-second timeout.
+- QEMU exposed that `uci batch` can return 0 after printing `uci: Entry not
+  found`; staging previously used quiet mode and accepted that failure.
+  The helper now treats UCI diagnostics as failure and isolates scratch UCI
+  deltas. The negative staging test passed after the fix.
+- The scheduled test changed a harmless logging parameter with `apply: none`;
+  it did not break connectivity. Firmware flashing, actual radio changes,
+  boot-time rollback and failures during arming or confirmation were not
+  tested. An earlier triangle-topology run intermittently failed peer health
+  checks; the passing fleet run uses a shared link and does not prove that
+  the controller tolerates transient packet loss.
+
 ## 2026-11-02
 
 ### Credentialed first-boot script ordering correction

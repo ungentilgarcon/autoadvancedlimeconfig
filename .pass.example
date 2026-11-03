@@ -10,6 +10,12 @@ MAIN_WIFI_KEY=
 MESH_WIFI_KEY=
 AP_HOSTNAME=PICOT-ap-%M4%M5%M6
 
+# Optional, used by fleet-libremesh.py when nodes do not accept SSH keys.
+# Needs the sshpass package. FLEET_SSH_PASSWORD applies to every node;
+# FLEET_SSH_PASSWORD_<NODE> (node name upper-cased, non-alphanumerics as _)
+# overrides it for one node.
+FLEET_SSH_PASSWORD=
+
 # Required by deploy-libremesh.py vlans.
 IOT_WIFI_KEY=
 GUEST_WIFI_KEY=

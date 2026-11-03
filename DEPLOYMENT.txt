@@ -68,6 +68,53 @@ To drop VLANs from one node and keep it meshing with VLAN nodes:
 
   python3 deploy-libremesh.py vlans --device BOARD --host root@HOST --disable
 
+Experimental fleet controller
+-----------------------------
+
+See README.md, "Fleet upgrades (experimental)", before use. This controller
+has not been validated on the physical fleet; use an isolated pilot and retain
+local/serial recovery access. Automatic firmware rollback is not provided.
+
+Copy fleet-inventory.example.json to the ignored fleet-inventory.json and
+provide each node's SSH host, device profile and mesh IP. Set SSH passwords,
+if needed, in the mode-600 .pass file using FLEET_SSH_PASSWORD or a
+FLEET_SSH_PASSWORD_<NODE> override; password SSH requires sshpass. Firmware
+board checks currently require key-based SSH. Secrets are not interpolated
+from .pass into UCI change files.
+
+Copy a fleet-changes/*.example.json template to a private ignored name and
+edit it. Review with --dry-run (which prints the UCI lines), then:
+
+  python3 fleet-libremesh.py backup
+  python3 fleet-libremesh.py config fleet-changes/my-change.json --id change-001
+  python3 fleet-libremesh.py status
+  python3 fleet-libremesh.py rollback change-001
+
+Rollback applies only to a pending, unconfirmed change. A config-breaking
+change is staged and scheduled on affected nodes, but arming and confirmation
+are best effort, not atomic; partial failures can leave nodes on different
+configurations. Peer checks only include selected nodes with mesh_ip entries.
+The firmware subcommand performs sequential sysupgrade -c with health checks,
+not firmware rollback. Confirm the ignore rules for any custom files and
+protect backups and command output, which may contain secrets.
+
+For archive comparison, per-node dry runs and experimental deployment, run:
+
+  python3 fleet-config-ui.py
+
+Select changed files and/or comma-separated packages and an inventory with a
+distinct mesh_ip for each node, run the dry run, then type DEPLOY when prompted.
+Package-only deployments do not require backups. APK simulates dependencies
+using cached indexes; OPKG checks package availability only. Update indexes
+on the nodes first if needed. The dry run does not install packages or validate
+UCI syntax; UCI files are validated at staging. Packages and dependencies are
+installed before files and are not rolled back if anything fails. A failed or
+timed-out install can be partial or still running. Nodes need flock.
+Scheduling and confirmation are best effort, not atomic;
+partial confirmation or lost nodes can require manual recovery. Health checks
+do not prove routing convergence. Use current helper versions, a test fleet,
+and independent recovery access; do not run older controllers concurrently.
+
 Firmware deployment deliberately preserves the existing network configuration;
 the separate optional VLAN command adds VLAN 10/20 on selected Wi-Fi radios
 with a timed rollback. It leaves Ethernet ports and the existing untagged main

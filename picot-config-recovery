@@ -1,0 +1,15 @@
+#!/bin/sh /etc/rc.common
+
+START=11
+
+start() {
+    pending=/root/libremesh-failsafe/cfg-pending
+
+    [ -s "$pending" ] || return 0
+    change=$(cat "$pending")
+    echo "Pending fleet config change found; restoring the previous configuration."
+    case "$change" in
+        files:*) /usr/sbin/picot-files-sync rollback-boot "${change#files:}" ;;
+        *) /usr/sbin/picot-config-sync rollback-boot "$change" ;;
+    esac
+}
