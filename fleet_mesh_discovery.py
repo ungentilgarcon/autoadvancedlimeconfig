@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 
 from fleet_archive import ArchiveError
+import fleet_identity_approvals as identity
 
 HOSTNAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
 MAX_CANDIDATES = 512
@@ -80,8 +81,10 @@ def discover(fleet, inventory: list, seed_host: str, inspect_inventory):
     if records is None or seed is None:
         raise ArchiveError("Mesh discovery failed: " + "; ".join(errors))
 
+    approvals = identity.load()
     details = inspect_inventory(inventory)
     seed_name = None
+    seed_record_name = None
     if seed_host:
         seed_info = inspect_inventory([seed])[0]
         seed_name = seed_info.get("hostname")
@@ -89,8 +92,23 @@ def discover(fleet, inventory: list, seed_host: str, inspect_inventory):
             raise ArchiveError(f"Cannot identify mesh seed: {seed_info.get('error') or 'hostname missing'}")
         if any(name.lower() == seed_name.lower() for name in ambiguous):
             raise ArchiveError("Mesh seed has ambiguous shared DNS addresses")
+        seed_record_name = seed_name
         if not any(name.lower() == seed_name.lower() for name in records):
-            raise ArchiveError("Mesh seed hostname is missing from shared DNS records")
+            matching = [
+                item for item in approvals
+                if item.address == seed_host.rsplit("@", 1)[-1]
+                and item.hostname.lower() == seed_name.lower()
+                and any(name.lower() == item.advertised.lower() and address == item.address
+                        for name, address in records.items())
+            ]
+            if len(matching) != 1:
+                raise ArchiveError("Mesh seed hostname is missing from shared DNS records")
+            approval = matching[0]
+            verified_seed = fleet.Node({"name": approval.advertised, "host": seed_host,
+                                        "mesh_ip": approval.address})
+            if identity.identify(fleet, verified_seed, approval.advertised) != approval:
+                raise ArchiveError("Mesh seed identity no longer matches its local approval")
+            seed_record_name = approval.advertised
     names = {node.name.lower() for node in inventory}
     names.update(item["hostname"].lower() for item in details if item.get("hostname"))
     addresses = {str(node.mesh_ip) for node in inventory if node.mesh_ip}
@@ -99,7 +117,7 @@ def discover(fleet, inventory: list, seed_host: str, inspect_inventory):
     for name, address in sorted(records.items(), key=lambda item: item[0].lower()):
         if name.lower() in names or address in addresses:
             continue
-        host = seed_host if seed_name and name.lower() == seed_name.lower() else f"root@{address}"
+        host = seed_host if seed_record_name and name.lower() == seed_record_name.lower() else f"root@{address}"
         candidates.append(fleet.Node({"name": name, "host": host, "mesh_ip": address}))
 
     observed = inspect_inventory(candidates)
@@ -111,14 +129,42 @@ def discover(fleet, inventory: list, seed_host: str, inspect_inventory):
         if name.lower() not in names
     ]
     eligible = []
-    for node, item in zip(candidates, observed):
+    eligible_addresses = set(addresses)
+    pairs = list(zip(candidates, observed))
+    pairs.sort(key=lambda pair: (
+        not (isinstance(pair[1].get("hostname"), str)
+             and pair[1]["hostname"].lower() == pair[0].name.lower()),
+        pair[0].name.lower(),
+    ))
+    for node, item in pairs:
         if item["status"] == "available":
             hostname = item.get("hostname")
             if not isinstance(hostname, str) or hostname.lower() != node.name.lower():
                 item["status"] = "unavailable"
                 item["error"] = "SSH router hostname does not match the shared DNS record"
-            else:
+                item["identity_reviewable"] = isinstance(hostname, str) and bool(hostname)
+                matches = [approval for approval in approvals
+                           if approval.advertised.lower() == node.name.lower()
+                           and approval.address == str(node.mesh_ip)]
+                if len(matches) == 1 and node.mesh_ip not in eligible_addresses:
+                    try:
+                        current = identity.identify(fleet, node, node.name)
+                        if current == matches[0] and current.hostname == hostname and current.board == item["board"]:
+                            item["status"] = "available"
+                            item["error"] = None
+                            item["identity_approved"] = True
+                            item["identity_reviewable"] = False
+                            node.identity_approval = current
+                        else:
+                            item["error"] = "Locally approved router identity changed; review it again"
+                    except (ArchiveError, fleet.DeployError, OSError) as error:
+                        item["error"] = f"Approved router identity could not be verified: {error}"
+            if item["status"] == "available" and node.mesh_ip in eligible_addresses:
+                item["status"] = "unavailable"
+                item["error"] = "Another router entry uses this address"
+            if item["status"] == "available":
                 eligible.append(node)
+                eligible_addresses.add(node.mesh_ip)
         item["source"] = "discovered"
 
     def check_mesh(node):

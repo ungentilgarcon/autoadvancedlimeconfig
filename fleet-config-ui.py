@@ -5,17 +5,22 @@ from __future__ import annotations
 
 import base64
 import binascii
+import ipaddress
 import json
 import re
 import secrets
 import sys
+import threading
 import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import fleet_file_deploy as deployment
+import fleet_firmware as firmware
+import fleet_identity_approvals as identity
 import fleet_mesh_discovery as mesh_discovery
+import fleet_radio_recovery as radio_recovery
 from fleet_archive import (
     MAX_ARCHIVE_BYTES,
     ArchiveError,
@@ -59,7 +64,8 @@ The node's package manager installs required dependencies from its configured re
 <input id="seed" type="text" placeholder="root@192.0.2.1"></label>
 <p>Discovery checks shared mesh DNS records, including non-router candidates. Only LibreMesh routers
 authenticated by SSH and matching their advertised hostname are added to deployment targets.
-Unknown SSH host keys must be verified separately.</p>
+Unknown SSH host keys must be verified separately. For a hostname mismatch, review and explicitly
+approve the already-trusted SSH identity; this does not change the router or shared DNS.</p>
 <button id="refresh-nodes" type="button">Refresh available nodes</button>
 <p id="node-status" role="status"></p><div id="node-results"></div>
 <label>Target selection <select id="target-mode">
@@ -74,6 +80,24 @@ Unknown SSH host keys must be verified separately.</p>
 <p id="status" role="status"></p><div id="results"></div>
 <button id="dry" type="button" disabled>Dry run against nodes</button>
 <button id="deploy" type="button" disabled>Deploy selected changes</button>
+<h2>AP-303 radio recovery</h2>
+<p class="warning">Install the experimental AP-303 workaround on the selected nodes without
+flashing firmware. It replaces the watchdog executable and service, but preserves an existing
+watchdog configuration. When enabled, it may restart the 2.4 GHz radio and interrupt clients.
+Service activation happens after file deployment and cannot be rolled back automatically.</p>
+<button id="radio-check" type="button">Dry run AP-303 workaround</button>
+<h2>Firmware upgrade</h2>
+<p class="warning">Firmware flashing can permanently brick a router and cannot be rolled back
+automatically. Use a matching sysupgrade image, test a pilot, and keep recovery access.
+The firmware check uploads the image temporarily to each selected node and runs
+<code>sysupgrade -T</code>; it does not flash. Configuration is kept with <code>sysupgrade -c</code>,
+but compatibility with the new firmware is not guaranteed. All targets must have the same live board.
+After reboot, the UI checks health but cannot prove the intended firmware was installed;
+verify the pilot firmware manually before continuing.</p>
+<label>Firmware image (.bin or .itb) <input id="firmware" type="file" accept=".bin,.itb"></label>
+<button id="firmware-check" type="button" disabled>Check firmware on selected nodes</button>
+<button id="firmware-flash" type="button" disabled>Flash pilot</button>
+<p id="firmware-status" role="status"></p>
 <script>
 const form=document.getElementById("form"), status=document.getElementById("status");
 const dry=document.getElementById("dry"), deploy=document.getElementById("deploy");
@@ -83,10 +107,18 @@ const inventoryInput=document.getElementById("inventory"), targetMode=document.g
 const discoverInput=document.getElementById("discover"), seedInput=document.getElementById("seed");
 const targetsInput=document.getElementById("targets"), nodeStatus=document.getElementById("node-status");
 const nodeResults=document.getElementById("node-results");
+const radioCheck=document.getElementById("radio-check");
+const firmwareInput=document.getElementById("firmware"), firmwareCheck=document.getElementById("firmware-check");
+const firmwareFlash=document.getElementById("firmware-flash"), firmwareStatus=document.getElementById("firmware-status");
 let uploaded=null, planId=null, planNodes=[], planExcluded=[], changeCount=0, revision=0, deploying=false;
+let planKind=null;
+let firmwarePlan=null, firmwarePhase=null, firmwareNodes=[], firmwarePilot=null, firmwareExcluded=[];
 let nodeRevision=0;
-function invalidate(){revision++;planId=null;planNodes=[];planExcluded=[];deploy.disabled=true}
-function updateDry(){dry.disabled=deploying||!uploaded||(!changeCount&&!uploaded.packages.trim())}
+function invalidate(){revision++;planId=null;planKind=null;planNodes=[];planExcluded=[];deploy.disabled=true;
+firmwarePlan=null;firmwarePhase=null;firmwareNodes=[];firmwarePilot=null;firmwareExcluded=[];firmwareFlash.disabled=true;
+firmwareStatus.textContent=""}
+function updateDry(){dry.disabled=deploying||!uploaded||(!changeCount&&!uploaded.packages.trim());
+firmwareCheck.disabled=deploying||!firmwareInput.files.length;radioCheck.disabled=deploying}
 function updatePackageOnly(){
 if(originalInput.files.length||editedInput.files.length)return false;
 uploaded={original:null,edited:null,packages:packagesInput.value};changeCount=0;
@@ -109,16 +141,40 @@ try{
 const data=await post("nodes",{inventory,discover:discoverInput.checked,seed});
 if(version!==nodeRevision)return;
 const table=document.createElement("table"), header=document.createElement("tr");
-for(const name of ["Node","Source","SSH host","Live model","Model ID","Status"]){
+for(const name of ["Node","Source","SSH host","Live hostname","Live model","Model ID","Status","Identity"]){
 const th=document.createElement("th");th.textContent=name;header.append(th)}table.append(header);
 for(const node of data.nodes){const row=document.createElement("tr");
-for(const value of [node.name,node.source||"inventory",node.host,node.model||"-",node.model_id||"-",
+for(const value of [node.name,node.source||"inventory",node.host,node.hostname||"-",node.model||"-",node.model_id||"-",
 node.status==="available"?"Available":node.error]){
-const cell=document.createElement("td");cell.textContent=value;row.append(cell)}table.append(row)}
+const cell=document.createElement("td");cell.textContent=value;row.append(cell)}
+const action=document.createElement("td");
+if(node.identity_approved)action.textContent="Locally approved";
+else if(node.identity_reviewable){
+const button=document.createElement("button");button.type="button";button.textContent="Review identity";
+button.addEventListener("click",()=>reviewIdentity(node));action.append(button)}
+row.append(action);table.append(row)}
 nodeResults.append(table);nodeStatus.textContent=data.nodes.length+" listed; "+
 data.nodes.filter(node=>node.status==="available").length+" verified or reachable. "+
 "Unverified discovered candidates are excluded from deployment.";
 }catch(error){if(version===nodeRevision)nodeStatus.textContent="Error: "+error.message}
+}
+async function reviewIdentity(node){
+invalidate();status.textContent="";nodeStatus.textContent="Rechecking authenticated router identity...";
+const version=revision;
+try{
+const review=await post("identity-review",{inventory:inventoryInput.value,discover:discoverInput.checked,
+seed:seedInput.value.trim(),advertised:node.name,host:node.host});
+if(version!==revision)return;
+const phrase="ACCEPT "+review.advertised;
+const answer=prompt("Shared DNS name: "+review.advertised+"\\nAddress: "+review.address+
+"\\nLive hostname: "+review.hostname+"\\nBoard: "+review.board+"\\nSSH host key: "+
+review.key_type+" "+review.fingerprint+"\\nVerify this key independently. This locally approves "+
+"this exact identity; it does not change the router or shared DNS. Type "+phrase+" to proceed:");
+if(answer!==phrase){nodeStatus.textContent="Identity was not approved.";return}
+await post("identity-approve",{review_id:review.review_id,confirmation:answer});
+if(version!==revision)return;
+nodeStatus.textContent="Identity approved locally; refreshing nodes.";await refreshNodes();
+}catch(error){if(version===revision)nodeStatus.textContent="Identity review failed: "+error.message}
 }
 document.getElementById("refresh-nodes").addEventListener("click",()=>{
 invalidate();status.textContent="";refreshNodes()});
@@ -136,6 +192,7 @@ if(summary)summary.textContent="Requested packages: "+(packagesInput.value.trim(
 for(const input of [originalInput,editedInput])input.addEventListener("change",()=>{
 invalidate();uploaded=null;changeCount=0;results.replaceChildren();status.textContent="";
 if(!updatePackageOnly())updateDry()});
+firmwareInput.addEventListener("change",()=>{invalidate();firmwareStatus.textContent="";updateDry()});
 for(const input of [document.getElementById("mode")]){
 input.addEventListener("change",()=>{invalidate();status.textContent=""})}
 inventoryInput.addEventListener("input",()=>{invalidate();status.textContent="";nodeRevision++;
@@ -189,17 +246,78 @@ status.textContent="Dry run passed for: "+result.nodes.join(", ")+". No packages
 planExcluded.map(item=>item.name+" ("+item.error+")").join(", ")+".":"")+
 (result.package_managers.length?" Package managers: "+result.package_managers.join(", ")+".":"");
 }catch(error){if(version===revision)status.textContent="Error: "+error.message}});
+radioCheck.addEventListener("click",async()=>{
+invalidate();status.textContent="Checking AP-303 workaround on selected nodes (read-only)...";
+const version=revision;
+try{
+const result=await post("radio-check",{inventory:inventoryInput.value,discover:discoverInput.checked,
+seed:seedInput.value.trim(),target_mode:targetMode.value,targets:targetsInput.value});
+if(version!==revision)return;
+planId=result.plan_id;planKind="radio";planNodes=result.nodes;planExcluded=result.excluded_candidates;
+deploy.disabled=false;
+status.textContent="AP-303 workaround dry run passed for: "+result.nodes.join(", ")+". Files: "+
+result.files.join(", ")+". Existing settings are preserved. No files or services were changed."+
+(planExcluded.length?" Excluded unverified candidates: "+planExcluded.map(item=>item.name).join(", ")+".":"");
+}catch(error){if(version===revision)status.textContent="Error: "+error.message}});
 deploy.addEventListener("click",async()=>{if(!planId)return;
 const answer=prompt("This will change: "+planNodes.join(", ")+". It may disconnect the mesh. "+
 (planExcluded.length?"Unverified candidates excluded: "+planExcluded.map(item=>item.name).join(", ")+". ":"")+
+(planKind==="radio"?"The watchdog will be enabled and restarted where its existing setting is enabled; "+
+"activation is not automatically rolled back and can lead to 2.4 GHz radio restarts. ":"")+
 "Packages and their dependencies are not rolled back; partial installation may remain. "+
 "File rollback and synchronization are best effort. Type DEPLOY to proceed:");
-if(answer!=="DEPLOY")return;const id=planId;invalidate();deploying=true;updateDry();
+if(answer!=="DEPLOY")return;const id=planId,kind=planKind;invalidate();deploying=true;updateDry();
 status.textContent="Deploying; keep this window open...";
 try{const result=await post("deploy",{plan_id:id,confirmation:answer});
-status.textContent="Deployment completed on all nodes. Change ID: "+result.change_id;
+status.textContent=kind==="radio"?
+"Workaround files deployed. Service restart succeeded on: "+(result.started.join(", ")||"none")+
+". Disabled by existing settings: "+(result.disabled.join(", ")||"none")+
+". Check service logs and status. Change ID: "+result.change_id:
+"Deployment completed on all nodes. Change ID: "+result.change_id;
 }catch(error){status.textContent="Deployment failed: "+error.message}
 finally{deploying=false;updateDry()}});
+firmwareCheck.addEventListener("click",async()=>{
+invalidate();firmwareStatus.textContent="Checking firmware on selected nodes; no firmware will be flashed...";
+const version=revision;
+try{
+const file=firmwareInput.files[0];if(!file)throw new Error("Select a firmware image");
+if(file.size>134217728)throw new Error("Firmware image must be at most 128 MiB");
+const image=await encoded(file);if(version!==revision)return;
+const result=await post("firmware-check",{filename:file.name,image,inventory:inventoryInput.value,
+discover:discoverInput.checked,seed:seedInput.value.trim(),target_mode:targetMode.value,targets:targetsInput.value});
+if(version!==revision)return;
+firmwarePlan=result.plan_id;firmwarePhase="pilot";firmwareNodes=result.nodes;firmwarePilot=result.pilot;
+firmwareExcluded=result.excluded_candidates;firmwareFlash.textContent="Flash pilot";firmwareFlash.disabled=false;
+firmwareStatus.textContent="Firmware check passed for: "+result.nodes.join(", ")+". Board: "+result.board+
+". SHA-256: "+result.sha256+". Pilot: "+result.pilot+"."+
+(firmwareExcluded.length?" Excluded unverified candidates: "+firmwareExcluded.join(", ")+".":"");
+}catch(error){if(version===revision)firmwareStatus.textContent="Firmware check failed: "+error.message}
+});
+firmwareFlash.addEventListener("click",async()=>{
+if(!firmwarePlan)return;
+const phase=firmwarePhase, required=phase==="pilot"?"FLASH PILOT":"FLASH REMAINING";
+const answer=prompt("Firmware flashing cannot be rolled back automatically. "+
+(phase==="pilot"?"Pilot: "+firmwarePilot+". Remaining nodes require separate confirmation. ":
+"Remaining targets: "+firmwareNodes.join(", ")+". Verify the pilot firmware manually first. ")+
+(firmwareExcluded.length?"Unverified candidates excluded: "+firmwareExcluded.join(", ")+". ":"")+
+"Type "+required+" to proceed:");
+if(answer!==required)return;const id=firmwarePlan;invalidate();deploying=true;updateDry();
+firmwareStatus.textContent="Flashing firmware; keep this window open. This may take several minutes...";
+const version=revision;
+try{
+const result=await post(phase==="pilot"?"firmware-pilot":"firmware-continue",{plan_id:id,confirmation:answer});
+if(version!==revision){firmwareStatus.textContent="Firmware operation completed, but settings changed; run a new check.";return}
+if(result.continue_id){
+firmwarePlan=result.continue_id;firmwarePhase="remaining";firmwareNodes=result.remaining;
+firmwareExcluded=result.excluded_candidates;firmwareFlash.textContent="Flash remaining nodes";firmwareFlash.disabled=false;
+firmwareStatus.textContent="Pilot "+result.pilot+" passed reboot and health checks; "+
+"the installed firmware was not independently verified. Verify it manually before confirming: "+
+result.remaining.join(", ")+".";
+}else firmwareStatus.textContent="Flash and reboot checks completed for: "+result.completed.join(", ")+
+". Verify the installed firmware manually; the UI cannot independently prove it was installed.";
+}catch(error){firmwareStatus.textContent="Firmware upgrade stopped: "+error.message}
+finally{deploying=false;updateDry()}
+});
 refreshNodes();
 </script></body></html>"""
 
@@ -311,6 +429,7 @@ def select_targets(nodes: list, target_mode: object, targets: object) -> tuple[l
 
 
 def verify_target_boards(nodes: list, expected: dict[str, str], hostnames: dict[str, str] | None = None) -> None:
+    identity.verify_nodes(deployment.fleet, nodes)
     if not expected:
         return
     if not expected.keys() <= {node.name for node in nodes}:
@@ -331,6 +450,44 @@ def verify_target_boards(nodes: list, expected: dict[str, str], hostnames: dict[
 
 def make_handler(token: str):
     plans: dict[str, tuple[float, list, str, dict[str, str], dict[str, str]]] = {}
+    firmware_plans: dict[str, tuple[float, firmware.FirmwarePlan, str, list[str]]] = {}
+    identity_reviews: dict[str, tuple[float, dict, identity.Approval]] = {}
+    firmware_lock = threading.Lock()
+
+    def review_identity(payload: dict) -> identity.Approval:
+        if payload.get("discover") is not True:
+            raise ArchiveError("Enable mesh discovery to review a hostname mismatch")
+        name, host = payload.get("advertised"), payload.get("host")
+        if not isinstance(name, str) or not isinstance(host, str) or not host.startswith("root@"):
+            raise ArchiveError("Invalid identity review request")
+        try:
+            address = str(ipaddress.ip_address(host[5:]))
+        except ValueError as error:
+            raise ArchiveError("Identity review requires a router IP address") from error
+        _, details = resolve_nodes(payload, include_inventory_details=False)
+        candidates = [item for item in details if item.get("source") == "discovered"
+                      and item.get("name") == name and item.get("host") == host
+                      and item.get("status") == "unavailable" and item.get("identity_reviewable")]
+        if len(candidates) != 1:
+            raise ArchiveError("The hostname mismatch is no longer available; refresh discovery")
+        node = deployment.fleet.Node({"name": name, "host": host, "mesh_ip": address})
+        current = identity.identify(deployment.fleet, node, name)
+        if current.hostname != candidates[0].get("hostname") or current.board != candidates[0].get("board"):
+            raise ArchiveError("Router identity changed during review; refresh discovery")
+        return current
+
+    def store_firmware_plan(identifier: str, plan: firmware.FirmwarePlan, phase: str,
+                            excluded: list[str]) -> None:
+        with firmware_lock:
+            firmware_plans[identifier] = (time.monotonic(), plan, phase, excluded)
+
+        def expire() -> None:
+            with firmware_lock:
+                firmware_plans.pop(identifier, None)
+
+        timer = threading.Timer(600, expire)
+        timer.daemon = True
+        timer.start()
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: object) -> None:
@@ -359,7 +516,10 @@ def make_handler(token: str):
 
         def do_POST(self) -> None:
             action = self.path.removeprefix(f"/{token}/")
-            if self.path != f"/{token}/{action}" or action not in ("nodes", "compare", "dry-run", "deploy"):
+            if self.path != f"/{token}/{action}" or action not in (
+                "nodes", "compare", "dry-run", "deploy", "firmware-check", "firmware-pilot",
+                "firmware-continue", "radio-check", "identity-review", "identity-approve",
+            ):
                 self.reply(404, b"Not found", "text/plain")
                 return
             origin = self.headers.get("Origin")
@@ -369,12 +529,104 @@ def make_handler(token: str):
                 return
             try:
                 length = int(self.headers.get("Content-Length", "0"))
-                if length <= 0 or length > (MAX_ARCHIVE_BYTES * 8 // 3 + 8192):
+                maximum = ((firmware.MAX_IMAGE_BYTES + 2) // 3 * 4 + 8192
+                           if action == "firmware-check" else MAX_ARCHIVE_BYTES * 8 // 3 + 8192)
+                if length <= 0 or length > maximum:
                     raise ArchiveError("Request exceeds the size limit")
                 payload = json.loads(self.rfile.read(length))
                 if not isinstance(payload, dict):
                     raise ArchiveError("Invalid request")
-                if action == "deploy":
+                if action in ("compare", "dry-run", "deploy", "firmware-check", "radio-check",
+                              "identity-review", "identity-approve"):
+                    with firmware_lock:
+                        firmware_plans.clear()
+                if action in ("firmware-check", "firmware-pilot", "firmware-continue", "radio-check",
+                              "identity-review", "identity-approve"):
+                    plans.clear()
+                if action == "identity-review":
+                    deployment.fleet.load_passwords(deployment.fleet.dl.DEFAULT_PASS_FILE)
+                    reviewed = review_identity(payload)
+                    now = time.monotonic()
+                    identity_reviews.clear()
+                    review_id = secrets.token_urlsafe(32)
+                    identity_reviews[review_id] = (now, payload, reviewed)
+                    result = {"review_id": review_id, **identity.asdict(reviewed)}
+                elif action == "identity-approve":
+                    review_id = payload.get("review_id")
+                    if not isinstance(review_id, str):
+                        raise ArchiveError("Invalid identity review")
+                    saved = identity_reviews.pop(review_id, None)
+                    if saved is None or time.monotonic() - saved[0] > 300:
+                        raise ArchiveError("Identity review expired or was already used; review again")
+                    expected = "ACCEPT " + saved[2].advertised
+                    if payload.get("confirmation") != expected:
+                        raise ArchiveError(f"Explicit {expected} confirmation is required")
+                    deployment.fleet.load_passwords(deployment.fleet.dl.DEFAULT_PASS_FILE)
+                    if review_identity(saved[1]) != saved[2]:
+                        raise ArchiveError("Router identity changed during confirmation; review again")
+                    identity.save(saved[2])
+                    result = {"approved": saved[2].advertised}
+                elif action == "firmware-check":
+                    deployment.fleet.load_passwords(deployment.fleet.dl.DEFAULT_PASS_FILE)
+                    nodes, details = resolve_nodes(payload, include_inventory_details=False)
+                    nodes, _ = select_targets(nodes, payload.get("target_mode", "all"),
+                                              payload.get("targets", ""))
+                    plan = firmware.prepare(nodes, payload.get("filename"), payload.get("image"),
+                                            inspect_inventory)
+                    excluded = [item["name"] for item in details if item.get("source") == "discovered"
+                                and item["status"] != "available"]
+                    plan_id = secrets.token_urlsafe(32)
+                    store_firmware_plan(plan_id, plan, "pilot", excluded)
+                    result = {"plan_id": plan_id, "nodes": [node.name for node in plan.nodes],
+                              "board": plan.board, "sha256": plan.digest, "pilot": plan.nodes[0].name,
+                              "excluded_candidates": excluded}
+                elif action in ("firmware-pilot", "firmware-continue"):
+                    expected_confirmation = "FLASH PILOT" if action == "firmware-pilot" else "FLASH REMAINING"
+                    plan_id = payload.get("plan_id")
+                    if not isinstance(plan_id, str) or payload.get("confirmation") != expected_confirmation:
+                        raise ArchiveError(f"Explicit {expected_confirmation} confirmation is required")
+                    with firmware_lock:
+                        saved = firmware_plans.pop(plan_id, None)
+                    phase = "pilot" if action == "firmware-pilot" else "remaining"
+                    if saved is None or saved[2] != phase or time.monotonic() - saved[0] > 600:
+                        raise ArchiveError("Firmware plan expired or was already used; run a new check")
+                    plan, excluded = saved[1], saved[3]
+                    targets = plan.nodes[:1] if phase == "pilot" else plan.nodes[1:]
+                    completed = []
+                    for index, node in enumerate(targets):
+                        try:
+                            firmware.flash_node(node, plan, inspect_inventory)
+                        except (ArchiveError, deployment.fleet.DeployError, OSError) as error:
+                            remaining = ", ".join(item.name for item in targets[index + 1:]) or "none"
+                            raise ArchiveError(
+                                f"Stopped on {node.name}: {error}. Completed in this step: "
+                                f"{', '.join(completed) or 'none'}. Not attempted: {remaining}."
+                            ) from error
+                        completed.append(node.name)
+                    result = {"completed": completed}
+                    if phase == "pilot" and len(plan.nodes) > 1:
+                        continuation = secrets.token_urlsafe(32)
+                        store_firmware_plan(continuation, plan, "remaining", excluded)
+                        result.update({"continue_id": continuation, "pilot": plan.nodes[0].name,
+                                       "remaining": [node.name for node in plan.nodes[1:]],
+                                       "excluded_candidates": excluded})
+                elif action == "radio-check":
+                    deployment.fleet.load_passwords(deployment.fleet.dl.DEFAULT_PASS_FILE)
+                    nodes, details = resolve_nodes(payload, include_inventory_details=False)
+                    nodes, _ = select_targets(nodes, payload.get("target_mode", "all"),
+                                              payload.get("targets", ""))
+                    planned, hostnames = radio_recovery.prepare(nodes, inspect_inventory)
+                    expected = {node.name: radio_recovery.BOARD for node in nodes}
+                    plan_id = secrets.token_urlsafe(32)
+                    plans[plan_id] = (time.monotonic(), planned, "radio", expected, hostnames)
+                    result = {"plan_id": plan_id, "nodes": [node.name for node in nodes],
+                              "files": ["/" + path for path, _ in radio_recovery.FILES],
+                              "excluded_candidates": [
+                                  {"name": item["name"], "error": item.get("error")}
+                                  for item in details if item.get("source") == "discovered"
+                                  and item["status"] != "available"
+                              ]}
+                elif action == "deploy":
                     plan_id = payload.get("plan_id")
                     if not isinstance(plan_id, str) or payload.get("confirmation") != "DEPLOY":
                         raise ArchiveError("Explicit DEPLOY confirmation is required")
@@ -382,7 +634,14 @@ def make_handler(token: str):
                     if plan is None or time.monotonic() - plan[0] > 600:
                         raise ArchiveError("Dry run expired or was already used; run it again")
                     verify_target_boards([item.node for item in plan[1]], plan[3], plan[4])
-                    result = {"change_id": deployment.deploy(plan[1], plan[2])}
+                    mode = "none" if plan[2] == "radio" else plan[2]
+                    result = {"change_id": deployment.deploy(plan[1], mode)}
+                    if plan[2] == "radio":
+                        try:
+                            started, disabled = radio_recovery.activate([item.node for item in plan[1]])
+                        except ArchiveError as error:
+                            raise ArchiveError(f"{error} Change ID: {result['change_id']}.") from error
+                        result.update({"started": started, "disabled": disabled})
                 elif action == "nodes":
                     deployment.fleet.load_passwords(deployment.fleet.dl.DEFAULT_PASS_FILE)
                     _, details = resolve_nodes(payload)
@@ -434,9 +693,9 @@ def make_handler(token: str):
                             and item["name"] in chosen_names
                         })
                         expected_hostnames = {
-                            item["name"]: item["name"] for item in details
+                            item["name"]: item["hostname"] for item in details
                             if item.get("source") == "discovered" and item["status"] == "available"
-                            and item["name"] in chosen_names
+                            and isinstance(item.get("hostname"), str) and item["name"] in chosen_names
                         }
                         planned = deployment.preflight(nodes, chosen, tuple(packages))
                         plan_id = secrets.token_urlsafe(32)

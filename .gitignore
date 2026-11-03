@@ -9,6 +9,7 @@
 # Fleet upgrades: inventories, change files, backups and logs are private.
 # Only *.example.json files are tracked.
 /fleet-inventory.json
+/fleet-discovery-approvals.json
 /fleet-changes/*
 !/fleet-changes/*.example.json
 /fleet-backups/

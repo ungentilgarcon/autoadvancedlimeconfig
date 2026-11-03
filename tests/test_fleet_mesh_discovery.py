@@ -91,6 +91,59 @@ class DiscoveryTests(unittest.TestCase):
             with self.assertRaisesRegex(ArchiveError, "host key rejected"):
                 discovery.discover(deployment.fleet, [node], "", lambda nodes: [])
 
+    def test_explicit_approval_requires_matching_live_key_and_never_duplicates_address(self):
+        approval = discovery.identity.Approval("old", "192.0.2.2", "new", "aruba,ap-303",
+                                                "ssh-ed25519", "SHA256:trusted")
+        dns = "192.0.2.1 seed\n192.0.2.2 old\n"
+
+        def remote(node, command, timeout):
+            return subprocess.CompletedProcess([], 0, dns if command == discovery.DNS_COMMAND else "", "")
+
+        def inspect(nodes):
+            return [{"name": node.name, "host": node.host, "status": "available",
+                     "hostname": "seed" if node.name in ("mesh-seed", "seed") else "new",
+                     "board": "aruba,ap-303", "model": "AP", "model_id": "aruba_ap-303", "error": None}
+                    for node in nodes]
+
+        with patch.object(deployment.fleet, "remote", side_effect=remote), \
+             patch.object(discovery.identity, "load", return_value=[approval]), \
+             patch.object(discovery.identity, "identify", return_value=approval):
+            nodes, details = discovery.discover(deployment.fleet, [], "root@192.0.2.1", inspect)
+            self.assertEqual([node.name for node in nodes], ["old", "seed"])
+            self.assertTrue(next(item for item in details if item["name"] == "old")["identity_approved"])
+            self.assertEqual(nodes[0].identity_approval, approval)
+            dns += "192.0.2.2 new\n"
+            nodes, details = discovery.discover(deployment.fleet, [], "root@192.0.2.1", inspect)
+            self.assertEqual([node.name for node in nodes], ["new", "seed"])
+            self.assertEqual(next(item for item in details if item["name"] == "old")["status"], "unavailable")
+
+        changed = discovery.identity.Approval("old", "192.0.2.2", "new", "aruba,ap-303",
+                                               "ssh-ed25519", "SHA256:changed")
+        dns = "192.0.2.1 seed\n192.0.2.2 old\n"
+        with patch.object(deployment.fleet, "remote", side_effect=remote), \
+             patch.object(discovery.identity, "load", return_value=[approval]), \
+             patch.object(discovery.identity, "identify", return_value=changed):
+            nodes, details = discovery.discover(deployment.fleet, [], "root@192.0.2.1", inspect)
+        self.assertEqual([node.name for node in nodes], ["seed"])
+        rejected = next(item for item in details if item["name"] == "old")
+        self.assertTrue(rejected["identity_reviewable"])
+        self.assertIn("identity changed", rejected["error"])
+
+    def test_approved_seed_can_use_old_dns_name(self):
+        approval = discovery.identity.Approval("old", "192.0.2.2", "new", "aruba,ap-303",
+                                                "ssh-ed25519", "SHA256:trusted")
+        def remote(node, command, timeout):
+            return subprocess.CompletedProcess([], 0, "192.0.2.2 old\n" if command == discovery.DNS_COMMAND else "", "")
+        def inspect(nodes):
+            return [{"name": node.name, "host": node.host, "status": "available", "hostname": "new",
+                     "board": "aruba,ap-303", "model": "AP", "model_id": "aruba_ap-303", "error": None}
+                    for node in nodes]
+        with patch.object(deployment.fleet, "remote", side_effect=remote), \
+             patch.object(discovery.identity, "load", return_value=[approval]), \
+             patch.object(discovery.identity, "identify", return_value=approval):
+            nodes, _ = discovery.discover(deployment.fleet, [], "root@192.0.2.2", inspect)
+        self.assertEqual([node.name for node in nodes], ["old"])
+
 
 if __name__ == "__main__":
     unittest.main()

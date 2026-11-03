@@ -114,6 +114,204 @@ class WebTests(unittest.TestCase):
                 self.post("nodes", payload)
         self.assertIn("missing-inventory.json", error.exception.read().decode())
 
+    def test_identity_review_requires_confirmation_and_rechecks_before_saving(self):
+        approval = ui.identity.Approval("old", "192.0.2.2", "new", "aruba,ap-303",
+                                         "ssh-ed25519", "SHA256:trusted")
+        node = {"source": "discovered", "name": "old", "host": "root@192.0.2.2",
+                "status": "unavailable", "identity_reviewable": True, "hostname": "new",
+                "board": "aruba,ap-303"}
+        payload = {"inventory": "", "discover": True, "seed": "root@192.0.2.1",
+                   "advertised": "old", "host": "root@192.0.2.2"}
+        with patch.object(ui.deployment.fleet, "load_passwords"), \
+             patch.object(ui, "resolve_nodes", return_value=([], [node])) as resolve, \
+             patch.object(ui.identity, "identify", return_value=approval) as identify, \
+             patch.object(ui.identity, "save") as save:
+            with self.post("identity-review", payload) as response:
+                review = json.load(response)
+            self.assertEqual(review["fingerprint"], "SHA256:trusted")
+            save.assert_not_called()
+            with self.assertRaises(urllib.error.HTTPError):
+                self.post("identity-approve", {"review_id": review["review_id"], "confirmation": "yes"})
+            save.assert_not_called()
+            with self.post("identity-review", payload) as response:
+                review = json.load(response)
+            with self.post("identity-approve", {"review_id": review["review_id"],
+                                                 "confirmation": "ACCEPT old"}) as response:
+                self.assertEqual(json.load(response)["approved"], "old")
+            self.assertEqual(resolve.call_count, 3)
+            self.assertEqual(identify.call_count, 3)
+            save.assert_called_once_with(approval)
+            with self.assertRaises(urllib.error.HTTPError):
+                self.post("identity-approve", {"review_id": review["review_id"],
+                                               "confirmation": "ACCEPT old"})
+
+    def test_identity_review_rejects_changed_or_untrusted_candidates(self):
+        original = ui.identity.Approval("old", "192.0.2.2", "new", "aruba,ap-303",
+                                         "ssh-ed25519", "SHA256:trusted")
+        changed = ui.identity.Approval("old", "192.0.2.2", "new", "aruba,ap-303",
+                                        "ssh-ed25519", "SHA256:changed")
+        candidate = {"source": "discovered", "name": "old", "host": "root@192.0.2.2",
+                     "status": "unavailable", "identity_reviewable": True, "hostname": "new",
+                     "board": "aruba,ap-303"}
+        payload = {"inventory": "", "discover": True, "seed": "root@192.0.2.1",
+                   "advertised": "old", "host": "root@192.0.2.2"}
+        with patch.object(ui.deployment.fleet, "load_passwords"), \
+             patch.object(ui, "resolve_nodes", return_value=([], [candidate])), \
+             patch.object(ui.identity, "identify", side_effect=[original, changed]), \
+             patch.object(ui.identity, "save") as save:
+            with self.post("identity-review", payload) as response:
+                review = json.load(response)
+            with self.assertRaises(urllib.error.HTTPError):
+                self.post("identity-approve", {"review_id": review["review_id"],
+                                               "confirmation": "ACCEPT old"})
+            save.assert_not_called()
+        with patch.object(ui.deployment.fleet, "load_passwords"), \
+             patch.object(ui, "resolve_nodes", return_value=([], [{**candidate, "identity_reviewable": False}])), \
+             patch.object(ui.identity, "identify") as identify:
+            with self.assertRaises(urllib.error.HTTPError):
+                self.post("identity-review", payload)
+            identify.assert_not_called()
+
+    def test_firmware_requires_pilot_and_second_confirmation(self):
+        nodes = [ui.deployment.fleet.Node({"name": name, "host": f"root@192.0.2.{i}",
+                                          "mesh_ip": f"192.0.2.{i}"})
+                 for i, name in enumerate(("a", "b", "c"), 1)]
+        image = b"firmware"
+        plan = ui.firmware.FirmwarePlan(image, "image.itb", "digest", "aruba,ap-303",
+                                        {node.name: node.name for node in nodes}, tuple(nodes))
+        payload = {"filename": "image.itb", "image": base64.b64encode(image).decode(),
+                   "inventory": "", "discover": True, "seed": "root@192.0.2.1",
+                   "target_mode": "nodes", "targets": "a,b,c"}
+        with patch.object(ui.deployment.fleet, "load_passwords"), \
+             patch.object(ui, "resolve_nodes", return_value=(nodes, [])), \
+             patch.object(ui.firmware, "prepare", return_value=plan) as prepare, \
+             patch.object(ui.firmware, "flash_node") as flash:
+            with self.post("firmware-check", payload) as response:
+                checked = json.load(response)
+            prepare.assert_called_once()
+            self.assertEqual(checked["pilot"], "a")
+            flash.assert_not_called()
+            with self.assertRaises(urllib.error.HTTPError):
+                self.post("firmware-pilot", {"plan_id": checked["plan_id"], "confirmation": "yes"})
+            flash.assert_not_called()
+            with self.post("firmware-pilot", {"plan_id": checked["plan_id"],
+                                              "confirmation": "FLASH PILOT"}) as response:
+                pilot = json.load(response)
+            self.assertEqual([call.args[0].name for call in flash.call_args_list], ["a"])
+            self.assertEqual(pilot["remaining"], ["b", "c"])
+            with self.assertRaises(urllib.error.HTTPError):
+                self.post("firmware-pilot", {"plan_id": checked["plan_id"],
+                                             "confirmation": "FLASH PILOT"})
+            with self.assertRaises(urllib.error.HTTPError):
+                self.post("firmware-continue", {"plan_id": pilot["continue_id"], "confirmation": "yes"})
+            with self.post("firmware-continue", {"plan_id": pilot["continue_id"],
+                                                 "confirmation": "FLASH REMAINING"}) as response:
+                self.assertEqual(json.load(response)["completed"], ["b", "c"])
+            self.assertEqual([call.args[0].name for call in flash.call_args_list], ["a", "b", "c"])
+            with self.assertRaises(urllib.error.HTTPError):
+                self.post("firmware-continue", {"plan_id": pilot["continue_id"],
+                                                 "confirmation": "FLASH REMAINING"})
+
+    def test_radio_workaround_dry_run_and_confirmed_deployment(self):
+        nodes = [ui.deployment.fleet.Node({"name": name, "host": f"root@192.0.2.{i}",
+                                          "mesh_ip": f"192.0.2.{i}"})
+                 for i, name in enumerate(("a", "b"), 1)]
+        plans = [ui.deployment.NodePlan(node, ()) for node in nodes]
+        payload = {"inventory": "", "discover": True, "seed": "root@192.0.2.1",
+                   "target_mode": "nodes", "targets": "a,b"}
+        with patch.object(ui.deployment.fleet, "load_passwords"), \
+             patch.object(ui, "resolve_nodes", return_value=(nodes, [])), \
+             patch.object(ui.radio_recovery, "prepare",
+                          return_value=(plans, {"a": "a", "b": "b"})) as prepare, \
+             patch.object(ui, "verify_target_boards") as verify, \
+             patch.object(ui.deployment, "deploy", return_value="change") as deploy, \
+             patch.object(ui.radio_recovery, "activate", return_value=(["a"], ["b"])) as activate:
+            with self.post("radio-check", payload) as response:
+                checked = json.load(response)
+            self.assertEqual(checked["nodes"], ["a", "b"])
+            self.assertEqual(len(checked["files"]), 3)
+            prepare.assert_called_once()
+            deploy.assert_not_called()
+            activate.assert_not_called()
+            with self.assertRaises(urllib.error.HTTPError):
+                self.post("deploy", {"plan_id": checked["plan_id"], "confirmation": "yes"})
+            with self.post("deploy", {"plan_id": checked["plan_id"], "confirmation": "DEPLOY"}) as response:
+                result = json.load(response)
+            self.assertEqual(result["started"], ["a"])
+            self.assertEqual(result["disabled"], ["b"])
+            verify.assert_called_once_with(nodes, {"a": ui.radio_recovery.BOARD,
+                                                   "b": ui.radio_recovery.BOARD},
+                                           {"a": "a", "b": "b"})
+            deploy.assert_called_once_with(plans, "none")
+            activate.assert_called_once_with(nodes)
+            with self.assertRaises(urllib.error.HTTPError):
+                self.post("deploy", {"plan_id": checked["plan_id"], "confirmation": "DEPLOY"})
+
+    def test_radio_workaround_does_not_activate_when_identity_or_deployment_fails(self):
+        node = ui.deployment.fleet.Node({"name": "a", "host": "root@192.0.2.1",
+                                         "mesh_ip": "192.0.2.1"})
+        plan = ui.deployment.NodePlan(node, ())
+        payload = {"inventory": "", "discover": True, "seed": "root@192.0.2.1",
+                   "target_mode": "all", "targets": ""}
+        with patch.object(ui.deployment.fleet, "load_passwords"), \
+             patch.object(ui, "resolve_nodes", return_value=([node], [])), \
+             patch.object(ui.radio_recovery, "prepare", return_value=([plan], {"a": "a"})), \
+             patch.object(ui, "verify_target_boards") as verify, \
+             patch.object(ui.deployment, "deploy") as deploy, \
+             patch.object(ui.radio_recovery, "activate") as activate:
+            for failure in ("identity", "deployment"):
+                with self.post("radio-check", payload) as response:
+                    checked = json.load(response)
+                verify.side_effect = ui.ArchiveError("changed") if failure == "identity" else None
+                deploy.side_effect = ui.ArchiveError("failed") if failure == "deployment" else None
+                with self.assertRaises(urllib.error.HTTPError):
+                    self.post("deploy", {"plan_id": checked["plan_id"], "confirmation": "DEPLOY"})
+            activate.assert_not_called()
+
+    def test_radio_activation_failure_reports_committed_change_id(self):
+        node = ui.deployment.fleet.Node({"name": "a", "host": "root@192.0.2.1",
+                                         "mesh_ip": "192.0.2.1"})
+        payload = {"inventory": "", "discover": True, "seed": "root@192.0.2.1",
+                   "target_mode": "all", "targets": ""}
+        with patch.object(ui.deployment.fleet, "load_passwords"), \
+             patch.object(ui, "resolve_nodes", return_value=([node], [])), \
+             patch.object(ui.radio_recovery, "prepare",
+                          return_value=([ui.deployment.NodePlan(node, ())], {"a": "a"})), \
+             patch.object(ui, "verify_target_boards"), \
+             patch.object(ui.deployment, "deploy", return_value="web-example"), \
+             patch.object(ui.radio_recovery, "activate",
+                          side_effect=ui.ArchiveError("files were deployed but activation failed")):
+            with self.post("radio-check", payload) as response:
+                checked = json.load(response)
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                self.post("deploy", {"plan_id": checked["plan_id"], "confirmation": "DEPLOY"})
+            self.assertIn("Change ID: web-example", error.exception.read().decode())
+            with self.assertRaises(urllib.error.HTTPError):
+                self.post("deploy", {"plan_id": checked["plan_id"], "confirmation": "DEPLOY"})
+
+    def test_firmware_failure_stops_remaining_nodes(self):
+        nodes = [ui.deployment.fleet.Node({"name": name, "host": "root@192.0.2.1"})
+                 for name in ("a", "b", "c")]
+        plan = ui.firmware.FirmwarePlan(b"image", "image.bin", "digest", "aruba,ap-303",
+                                        {node.name: node.name for node in nodes}, tuple(nodes))
+        payload = {"filename": "image.bin", "image": "aW1hZ2U=", "inventory": "",
+                   "target_mode": "all", "targets": ""}
+        with patch.object(ui.deployment.fleet, "load_passwords"), \
+             patch.object(ui, "resolve_nodes", return_value=(nodes, [])), \
+             patch.object(ui.firmware, "prepare", return_value=plan), \
+             patch.object(ui.firmware, "flash_node", side_effect=[None, ui.ArchiveError("unhealthy")]) as flash:
+            with self.post("firmware-check", payload) as response:
+                checked = json.load(response)
+            with self.post("firmware-pilot", {"plan_id": checked["plan_id"],
+                                              "confirmation": "FLASH PILOT"}) as response:
+                continuation = json.load(response)["continue_id"]
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                self.post("firmware-continue", {"plan_id": continuation, "confirmation": "FLASH REMAINING"})
+            self.assertIn("Not attempted: c", error.exception.read().decode())
+            self.assertEqual([call.args[0].name for call in flash.call_args_list], ["a", "b"])
+            with self.assertRaises(urllib.error.HTTPError):
+                self.post("firmware-continue", {"plan_id": continuation, "confirmation": "FLASH REMAINING"})
+
     def test_deploy_requires_dry_run_and_explicit_confirmation(self):
         original = base64.b64encode(archive([("etc/config/a", b"old\n")])).decode()
         edited = base64.b64encode(archive([("etc/config/a", b"new\n")])).decode()
@@ -379,6 +577,29 @@ class WebTests(unittest.TestCase):
                 with self.assertRaises(urllib.error.HTTPError):
                     self.post("deploy", {"plan_id": data["plan_id"], "confirmation": "DEPLOY"})
             deploy.assert_not_called()
+
+    def test_approved_discovered_node_uses_live_hostname_and_rechecks_approval(self):
+        found = ui.deployment.fleet.Node({"name": "old", "host": "root@192.0.2.2",
+                                          "mesh_ip": "192.0.2.2"})
+        found.identity_approval = ui.identity.Approval("old", "192.0.2.2", "new", "aruba,ap-303",
+                                                       "ssh-ed25519", "SHA256:trusted")
+        details = [{"name": "old", "source": "discovered", "status": "available",
+                    "board": "aruba,ap-303", "hostname": "new", "identity_approved": True}]
+        plans = [ui.deployment.NodePlan(found, (), ("nano",), "apk")]
+        payload = {"original": None, "edited": None, "packages": "nano", "selected": [],
+                   "inventory": "", "seed": "root@192.0.2.1", "discover": True, "mode": "none"}
+        with patch.object(ui.deployment.fleet, "load_passwords"), \
+             patch.object(ui, "resolve_nodes", return_value=([found], details)), \
+             patch.object(ui.deployment, "preflight", return_value=plans), \
+             patch.object(ui, "inspect_inventory", return_value=details), \
+             patch.object(ui.identity, "verify_nodes") as verify, \
+             patch.object(ui.deployment, "deploy", return_value="web-id") as deploy:
+            with self.post("dry-run", payload) as response:
+                data = json.load(response)
+            with self.post("deploy", {"plan_id": data["plan_id"], "confirmation": "DEPLOY"}) as response:
+                self.assertEqual(json.load(response)["change_id"], "web-id")
+            verify.assert_called_once_with(ui.deployment.fleet, [found])
+            deploy.assert_called_once()
 
     def test_seed_only_discovery_lists_and_targets_authenticated_mesh_routers(self):
         def remote(node, command, timeout):

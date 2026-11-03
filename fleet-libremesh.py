@@ -524,11 +524,15 @@ def upgrade_node(node: Node, nodes: list[Node], image: Path, version: str | None
         print(f"  image rejected by the node: {check.stderr.strip() or 'checksum mismatch'}")
         remote(node, f"rm -f {remote_image}")
         return False
-    remote(node, f"nohup sh -c 'sleep 2; exec sysupgrade -c -v {remote_image}' "
-                 ">/tmp/libremesh-sysupgrade.log 2>&1 </dev/null &", timeout=20)
-    print("  flashing, waiting for the node to reboot...")
+    launch = remote(node, dl.sysupgrade_background_command(remote_image), timeout=20)
+    if launch.returncode:
+        print("  launch outcome is uncertain; inspect the node and staged image before retrying: "
+              + (launch.stderr.strip() or "remote command failed"))
+        return False
+    print("  launch requested, waiting for the node to reboot...")
     if not wait_for_reboot(node, args.reboot_timeout):
-        print("  node did not come back in time")
+        print("  reboot was not observed or the node did not return; inspect the node and "
+              "/tmp/libremesh-sysupgrade.log before retrying")
         return False
     try:
         dl.check_remote_board(node.host, device)

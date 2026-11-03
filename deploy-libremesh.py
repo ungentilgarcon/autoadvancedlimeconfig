@@ -55,6 +55,14 @@ class DeployError(Exception):
     pass
 
 
+def sysupgrade_background_command(remote_image: str) -> str:
+    return (
+        "trap '' HUP; (sleep 2; exec sysupgrade -c -v "
+        + shlex.quote(remote_image)
+        + ") >/tmp/libremesh-sysupgrade.log 2>&1 </dev/null &"
+    )
+
+
 def _ssh_command(program: str) -> list[str]:
     command = [program, "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes"]
     # Optional alternate ssh_config (used by the emulator testbed); the
@@ -1511,13 +1519,9 @@ def stage_image(args: argparse.Namespace, image_path: Path) -> None:
             print(f"Type exactly '{confirmation}' to continue:")
             if input("> ").strip() != confirmation:
                 raise DeployError("Flash cancelled; staged files were left in place")
-            remote_flash = (
-                "nohup sh -c "
-                + shlex.quote(f"sleep 2; exec sysupgrade -c -v {remote_image}")
-                + " >/tmp/libremesh-sysupgrade.log 2>&1 </dev/null &"
-            )
-            ssh(args.host, remote_flash)
-            print("Upgrade started. Reconnect after the device reboots.")
+            ssh(args.host, sysupgrade_background_command(remote_image))
+            print("Upgrade launch requested. Verify the reboot and inspect "
+                  "/tmp/libremesh-sysupgrade.log if it does not happen.")
     finally:
         if backup_path:
             backup_path.unlink(missing_ok=True)

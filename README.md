@@ -5,6 +5,11 @@ contains existing device configuration backups, firmware images and notes,
 plus a script for requesting current customized LibreMesh firmware and staging
 it on a device with a configuration rollback available.
 
+> **Alpha software:** selected fleet UI, firmware and radio-recovery features
+> have been tested on live hardware, but remain experimental. They may
+> disconnect nodes or fail to recover automatically. Test one pilot first and
+> keep independent recovery access; live testing is not a guarantee of reliability.
+
 > **VLAN support is optional and is not active on the devices yet.** The
 > `vlans` command can apply it to one explicitly selected node at a time, with
 > an automatic rollback timer. Existing nodes and the main network remain
@@ -534,9 +539,23 @@ Set `enabled` to `1`, commit, and start the service to re-enable it. The image
 contains a boot service link; the generated configure command also enables and
 starts the service if present, but respects the UCI `enabled` setting.
 An external `--fixes-dir` replaces these files, and prebuilt images are
-unchanged. A real AP-303 image was built and its watchdog files and boot link
-inspected; the watchdog and a configuration-preserving upgrade have not been
-tested on hardware.
+unchanged. An AP-303 image was built and its watchdog files and boot link
+inspected. The radio recovery workaround has also been reported working on
+live AP-303 hardware. It remains alpha and is not a proven fix for the
+underlying fault; configuration retention across upgrades is not guaranteed.
+
+To install the workaround without flashing firmware, use **Dry run AP-303
+workaround** in the fleet UI after selecting AP-303 nodes. The dry run verifies
+each node's live board and hostname and prepares the three files for review.
+Confirm with **Deploy selected changes** and `DEPLOY`. Existing
+`/etc/config/picot-radio-recovery` settings are preserved; the service and
+executable are replaced. After the file transaction is confirmed, the UI
+enables and restarts the service on nodes whose existing setting is enabled,
+and reports nodes where it is disabled. Service activation is not automatically
+rolled back: if it fails, inspect the reported nodes and start or repair the
+service manually. A successful restart command does not prove that the watchdog
+remains healthy; check its status and `logread -e picot-radio-recovery`.
+Do not run concurrent fleet changes, and use independent recovery access.
 
 #### Embed Wi-Fi and mesh credentials locally
 
@@ -848,17 +867,33 @@ host. The inventory field is filled automatically only if
 `fleet-inventory.json` exists in the controller's current directory. To use
 only a seed without an inventory, leave the inventory field empty and enter
 its SSH host (for example `root@10.100.159.52`). The seed's own hostname
-must be present in shared DNS. The seed can use SSH keys or the shared
+must be present in shared DNS unless its identity mismatch was explicitly
+approved locally. The seed can use SSH keys or the shared
 `FLEET_SSH_PASSWORD`; an explicit seed uses the node-specific password key
 `FLEET_SSH_PASSWORD_MESH_SEED` if configured.
 
 Shared DNS can include clients as well as routers. Each candidate must accept
 SSH, report a matching hostname and OpenWrt board, and have `lime-config`
-installed before it is added to the targets. Unverified candidates are listed
+installed before it is added to the targets, unless a hostname mismatch is
+explicitly approved as described below. Unverified candidates are listed
 with their errors and excluded, including routers whose SSH host keys have not
 been verified or credentials are unavailable. Verify host keys by a trusted
 method and add them to the controller's known hosts; discovery never accepts
 unknown keys. Disable discovery to use only the inventory.
+
+For a discovered router with a hostname mismatch, **Review identity** displays
+the shared DNS name, IP, live hostname, board and authenticated SSH host-key
+fingerprint. Independently verify the key and device identity before typing
+the displayed `ACCEPT` confirmation. The UI then approves that exact mapping
+locally; it does **not** rename the router or change shared DNS. The old DNS
+name remains the node-selection name until DNS is corrected. Approvals are
+stored in the private, Git-ignored `fleet-discovery-approvals.json` in the
+controller's working directory. Delete that file to revoke all such approvals.
+The UI rechecks the trusted SSH key, hostname and board during discovery and
+before deployment; a changed or revoked identity is excluded. Already running
+operations are not cancelled by deleting the file.
+Identity approval has been reported working on live AP-303 hardware; it
+remains an alpha feature.
 
 Discovery depends on the seed's current
 `/tmp/hosts/shared-state-dnsmasq_hosts`, which can be stale or incomplete;
@@ -881,6 +916,47 @@ preflighted and deployed; their peer health checks likewise cover only the
 selected nodes. Model-targeted nodes are checked again before deployment, and
 a changed or unavailable board invalidates the plan. Discovered targets also
 have their hostname checked again before deployment.
+
+#### Firmware images in the UI
+
+The **Firmware upgrade** section accepts one `.bin` or `.itb` sysupgrade
+image, up to 128 MiB, for the current target selection. Every selected node
+must report the same live board model; use model or node-name targeting for
+mixed fleets. The image must be obtained from a trusted source and be the
+correct sysupgrade image for that exact board and hardware variant. A
+successful device compatibility test does not authenticate its origin.
+An AP-303 firmware upgrade to OpenWrt 25.12.6 was observed on live hardware,
+followed by successful basic connectivity checks. This limited test does not
+prove exact-image installation, configuration retention, or fleet-wide safety.
+
+**Check firmware on selected nodes** uploads the image and a temporary health
+helper to each target, verifies the image's transfer SHA-256, runs
+`sysupgrade -T`, and removes the temporary files. It does not flash, but it
+does use router `/tmp` storage and can fail if there is insufficient space.
+Each target also needs `flock` and must have no pending fleet configuration.
+It checks mesh health against the selected nodes only. The check displays the
+selected nodes, board, SHA-256, pilot, and any excluded discovery candidates;
+the confirmation identifies the nodes about to be flashed and excluded
+candidates. Review them carefully.
+
+Type `FLASH PILOT` to upgrade the pilot. The UI checks the board, hostname,
+health, checksum and image again before flashing, then waits for a new boot
+ID and healthy connectivity. If the selection includes more nodes, a separate
+`FLASH REMAINING` confirmation is required; remaining nodes are flashed one at
+a time, stopping at the first failure. Inventory canary nodes are ordered
+first and inventory gateways last; auto-discovered nodes do not have those
+inventory roles. Plans expire after 10 minutes, including the continuation
+plan after a successful pilot. A failed or uncertain flash requires manual
+inspection before retrying.
+
+Firmware uses `sysupgrade -c` to retain configuration, but retained settings
+may not work on the new release. Firmware can brick a router and is **not**
+automatically rolled back. Have independent recovery access; do not run
+concurrent fleet changes or upgrades. A changed boot ID and passing health
+checks do not prove that the intended firmware was installed. Verify the
+running firmware manually, particularly on the pilot before continuing.
+The UI does not verify firmware
+signatures or guarantee that all mesh members were discovered.
 
 Select files and/or packages and an inventory, then choose **Dry run against
 nodes**. For package-only deployments, entering package names enables the

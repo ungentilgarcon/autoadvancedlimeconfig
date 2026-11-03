@@ -14,6 +14,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+import fleet_identity_approvals as identity
 from fleet_archive import (
     MAX_FILE_BYTES,
     MAX_TOTAL_BYTES,
@@ -302,6 +303,7 @@ def deploy(plans: list[NodePlan], mode: str, *, lead: int = 60, window: int = 60
     package_attempted = []
     package_completed = []
     try:
+        identity.verify_nodes(fleet, nodes)
         for plan in plans:
             if plan.packages:
                 check_packages(plan.node, plan.packages, plan.package_manager)
@@ -323,6 +325,7 @@ def deploy(plans: list[NodePlan], mode: str, *, lead: int = 60, window: int = 60
             for plan in plans:
                 staged.append(plan.node)
                 _stage(plan, change_id, mode, Path(directory))
+        identity.verify_nodes(fleet, nodes)
         offsets = fleet.parallel(nodes, fleet.clock_offset)
         target = time.time() + lead
         for node in nodes:
