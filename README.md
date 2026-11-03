@@ -70,6 +70,13 @@ role** (any device with an uplink can be a WAN node). `--device` accepts:
 - a Firmware Selector profile id (`aruba_ap-303`), or
 - the shortcuts `redmi-ax6000-ubootmod` and `aruba-ap-303`.
 
+Not sure of the exact name? Search the current release's profile list (all
+words must match the id, vendor or model); use the first column as `--device`:
+
+```sh
+python3 deploy-libremesh.py build --list-devices redmi ax6000
+```
+
 The build target (e.g. `ipq40xx/generic`) is discovered from the Selector; add
 `--target` only if a profile exists for several targets. The board check on the
 device compares names with `,` and `_` treated alike. The flash confirmation

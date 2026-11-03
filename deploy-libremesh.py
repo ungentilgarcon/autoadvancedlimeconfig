@@ -309,6 +309,47 @@ def fetch_profile(config: dict, version: str, device: dict) -> tuple[dict, dict,
     return overview, profile_index, profile
 
 
+def list_devices(args: argparse.Namespace) -> None:
+    """Print Selector profiles whose id, vendor or model match every search word."""
+    config = selector_config()
+    status, versions = http_json(f"{config['image_url']}/.versions.json")
+    if status != 200:
+        raise DeployError(f"Could not retrieve OpenWrt release list (HTTP {status})")
+    version = versions.get("stable_version") if args.version == "latest" else args.version
+    if not version or not re.fullmatch(r"[A-Za-z0-9._-]+", version):
+        raise DeployError(f"Invalid or unavailable release version: {version!r}")
+    base = (
+        f"{config['image_url']}/snapshots"
+        if version == "SNAPSHOT"
+        else f"{config['image_url']}/releases/{version}"
+    )
+    status, overview = http_json(f"{base}/.overview.json")
+    if status != 200:
+        raise DeployError(f"OpenWrt {version} profile list unavailable (HTTP {status})")
+
+    words = " ".join(args.list_devices).lower().split()
+    rows = []
+    for profile in overview.get("profiles", []):
+        titles = [
+            " ".join(
+                part
+                for part in (t.get("vendor"), t.get("model"), t.get("variant"))
+                if part
+            )
+            for t in profile.get("titles", [])
+        ]
+        haystack = " ".join([profile.get("id", ""), *titles]).lower().replace("-", " ")
+        if all(word.replace("-", " ") in haystack for word in words):
+            rows.append((profile.get("id", ""), profile.get("target", ""), "; ".join(titles)))
+    if not rows:
+        raise DeployError(f"No OpenWrt {version} profile matches {' '.join(args.list_devices)!r}")
+    print(f"OpenWrt {version} profiles matching '{' '.join(words)}':")
+    width = max(len(row[0]) for row in rows)
+    for profile_id, target, title in sorted(rows):
+        print(f"  {profile_id:<{width}}  {target:<22} {title}")
+    print("Use the first column with --device (add --target if one id has several targets).")
+
+
 def build_image(args: argparse.Namespace) -> Path | None:
     if args.inject_pass and args.uci_defaults:
         raise DeployError(
@@ -1363,10 +1404,10 @@ def stage_image(args: argparse.Namespace, image_path: Path) -> None:
             backup_path.unlink(missing_ok=True)
 
 
-def add_device_option(parser: argparse.ArgumentParser) -> None:
+def add_device_option(parser: argparse.ArgumentParser, required: bool = True) -> None:
     parser.add_argument(
         "--device",
-        required=True,
+        required=required,
         metavar="DEVICE",
         help="OpenWrt board name (e.g. aruba,ap-303), Selector profile id "
         "(aruba_ap-303), or shortcut: " + ", ".join(sorted(DEVICES)),
@@ -1399,7 +1440,14 @@ def add_package_options(parser: argparse.ArgumentParser) -> None:
 
 
 def add_build_options(parser: argparse.ArgumentParser) -> None:
-    add_device_option(parser)
+    add_device_option(parser, required=False)
+    parser.add_argument(
+        "--list-devices",
+        nargs="*",
+        metavar="SEARCH",
+        help="List Selector device ids matching all search words (e.g. "
+        "redmi ax6000; all if none given) and exit",
+    )
     parser.add_argument(
         "--inject-pass",
         action="store_true",
@@ -1549,6 +1597,12 @@ def main() -> int:
                 "preserves the current config. Build and stage the image, then install "
                 "it with config reset using local recovery access."
             )
+        if args.command in ("build", "deploy"):
+            if args.list_devices is not None:
+                list_devices(args)
+                return 0
+            if not args.device:
+                parser.error("--device is required (use --list-devices SEARCH to find it)")
         if args.command == "build":
             build_image(args)
         elif args.command == "stage":
