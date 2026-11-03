@@ -841,14 +841,32 @@ the local process/browser memory and are not written into the repository.
 The URL contains an access token; do not share it. The interface listens only
 on `127.0.0.1`.
 
-The UI reads the inventory and queries each listed node over SSH for its live
-OpenWrt model and board ID. Use **Refresh available nodes** after changing the
-inventory or when a node comes back online. Unreachable nodes and query errors
-are shown; this is not an automatic mesh scan or a deployment health check.
-SSH host keys must already be verified, and password access uses the fleet
-password settings described below.
+The UI queries nodes over SSH for their live OpenWrt model and board ID.
+Automatic mesh discovery is enabled by default. It reads LibreMesh shared DNS
+records from a reachable inventory node, or from the optional mesh seed SSH
+host. To use only a seed without an inventory, clear the inventory field and
+enter its SSH host (for example `root@10.100.159.52`). The seed's own hostname
+must be present in shared DNS. The seed can use SSH keys or the shared
+`FLEET_SSH_PASSWORD`; an explicit seed uses the node-specific password key
+`FLEET_SSH_PASSWORD_MESH_SEED` if configured.
 
-Choose **All inventory nodes** (the default), **Node names**, or **Models**.
+Shared DNS can include clients as well as routers. Each candidate must accept
+SSH, report a matching hostname and OpenWrt board, and have `lime-config`
+installed before it is added to the targets. Unverified candidates are listed
+with their errors and excluded, including routers whose SSH host keys have not
+been verified or credentials are unavailable. Verify host keys by a trusted
+method and add them to the controller's known hosts; discovery never accepts
+unknown keys. Disable discovery to use only the inventory.
+
+Discovery depends on the seed's current
+`/tmp/hosts/shared-state-dnsmasq_hosts`, which can be stale or incomplete;
+it cannot guarantee detection of every mesh member. It does not scan the
+entire subnet or prove deployment health. Use **Refresh available nodes** to query
+again. The dry run performs discovery again and reports its exact target list
+and the names and errors of excluded candidates; review both before confirming
+a deployment.
+
+Choose **All inventory and discovered routers** (the default), **Node names**, or **Models**.
 For node names and models, enter exact comma-separated values shown in the
 table, for example `ap-1, ap-2` or
 `aruba_ap-303, xiaomi_redmi-router-ax6000-ubootmod`. Model selection uses the
@@ -859,7 +877,8 @@ target a partial fleet, explicitly select node names instead. Unknown,
 duplicate, or empty entries are rejected. Only the selected nodes are
 preflighted and deployed; their peer health checks likewise cover only the
 selected nodes. Model-targeted nodes are checked again before deployment, and
-a changed or unavailable board invalidates the plan.
+a changed or unavailable board invalidates the plan. Discovered targets also
+have their hostname checked again before deployment.
 
 Select files and/or packages and an inventory, then choose **Dry run against
 nodes**. For package-only deployments, entering package names enables the

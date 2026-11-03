@@ -328,5 +328,71 @@ class WebTests(unittest.TestCase):
             ui.verify_target_boards([node], {"a": "aruba,ap-303", "b": "aruba,ap-303"})
         inspect.assert_not_called()
 
+    def test_discovered_nodes_are_included_and_identity_rechecked_before_deploy(self):
+        seed = ui.deployment.fleet.Node({"name": "seed", "host": "root@192.0.2.1",
+                                         "mesh_ip": "192.0.2.1"})
+        found = ui.deployment.fleet.Node({"name": "found", "host": "root@192.0.2.2",
+                                          "mesh_ip": "192.0.2.2"})
+        details = [
+            {"name": "seed", "source": "inventory", "status": "available",
+             "board": "vendor,seed", "hostname": "seed"},
+            {"name": "found", "source": "discovered", "status": "available",
+             "board": "aruba,ap-303", "hostname": "found"},
+            {"name": "client", "source": "discovered", "status": "unavailable", "error": "host key rejected"},
+        ]
+        plans = [ui.deployment.NodePlan(seed, (), ("nano",), "apk"),
+                 ui.deployment.NodePlan(found, (), ("nano",), "apk")]
+        payload = {"original": None, "edited": None, "packages": "nano", "selected": [],
+                   "inventory": "", "seed": "root@192.0.2.1", "discover": True, "mode": "none"}
+        with patch.object(ui.deployment.fleet, "load_passwords"), \
+             patch.object(ui, "resolve_nodes", return_value=([seed, found], details)), \
+             patch.object(ui.deployment, "preflight", return_value=plans) as preflight, \
+             patch.object(ui.deployment, "deploy") as deploy:
+            with self.post("dry-run", payload) as response:
+                data = json.load(response)
+            self.assertEqual(data["nodes"], ["seed", "found"])
+            self.assertEqual(data["excluded_candidates"], [{"name": "client", "error": "host key rejected"}])
+            self.assertEqual(preflight.call_args.args[0], [seed, found])
+            changed = {"name": "found", "status": "available", "board": "aruba,ap-303",
+                       "hostname": "different"}
+            with patch.object(ui, "inspect_inventory", return_value=[changed]):
+                with self.assertRaises(urllib.error.HTTPError):
+                    self.post("deploy", {"plan_id": data["plan_id"], "confirmation": "DEPLOY"})
+            deploy.assert_not_called()
+
+    def test_seed_only_discovery_lists_and_targets_authenticated_mesh_routers(self):
+        def remote(node, command, timeout):
+            if command == ui.mesh_discovery.DNS_COMMAND:
+                return subprocess.CompletedProcess([], 0, "192.0.2.1 seed\n192.0.2.2 router\n", "")
+            if command == ui.mesh_discovery.MESH_COMMAND:
+                return subprocess.CompletedProcess([], 0, "", "")
+            if command == "ubus call system board":
+                name = "seed" if node.name == "mesh-seed" else node.name
+                return subprocess.CompletedProcess([], 0, json.dumps({
+                    "hostname": name, "model": "AP", "board_name": "aruba,ap-303",
+                }), "")
+            self.fail(f"Unexpected remote command: {command}")
+
+        payload = {"original": None, "edited": None, "packages": "nano", "selected": [],
+                   "inventory": "", "seed": "root@192.0.2.1", "discover": True, "mode": "none",
+                   "target_mode": "models", "targets": "aruba_ap-303"}
+        def preflight(nodes, changes, packages):
+            return [ui.deployment.NodePlan(node, (), packages, "apk") for node in nodes]
+
+        with patch.object(ui.deployment.fleet, "load_passwords"), \
+             patch.object(ui.deployment.fleet, "remote", side_effect=remote), \
+             patch.object(ui.deployment, "preflight", side_effect=preflight) as check, \
+             patch.object(ui.deployment, "deploy", return_value="web-id"):
+            with self.post("nodes", payload) as response:
+                self.assertEqual({item["name"] for item in json.load(response)["nodes"]},
+                                 {"seed", "router"})
+            with self.post("dry-run", payload) as response:
+                result = json.load(response)
+            self.assertEqual(result["nodes"], ["router", "seed"])
+            self.assertEqual([node.mesh_ip for node in check.call_args.args[0]],
+                             ["192.0.2.2", "192.0.2.1"])
+            with self.post("deploy", {"plan_id": result["plan_id"], "confirmation": "DEPLOY"}) as response:
+                self.assertEqual(json.load(response)["change_id"], "web-id")
+
 if __name__ == "__main__":
     unittest.main()

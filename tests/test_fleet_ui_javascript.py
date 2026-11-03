@@ -27,12 +27,13 @@ class Element {
 }
 const elements = Object.fromEntries(
   ["form", "status", "dry", "deploy", "original", "edited", "packages", "inventory", "mode", "results",
-   "refresh-nodes", "node-status", "node-results", "target-mode", "targets"]
+   "refresh-nodes", "node-status", "node-results", "target-mode", "targets", "discover", "seed"]
   .map(id => [id, new Element()]));
 elements.dry.disabled = elements.deploy.disabled = true;
 elements.inventory.value = "fleet-inventory.json";
 elements.mode.value = "none";
 elements["target-mode"].value = "all";
+elements.discover.checked = true;
 let requests = [];
 let delayed;
 const context = {
@@ -53,6 +54,7 @@ vm.runInNewContext(script, context);
 (async () => {
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(requests[0].path, "nodes");
+  assert.equal(requests[0].payload.discover, true);
   requests.length = 0;
   elements.packages.value = "jq";
   elements.packages.fire("input");
@@ -66,6 +68,7 @@ vm.runInNewContext(script, context);
   assert.equal(requests[0].payload.edited, null);
   assert.equal(requests[0].payload.packages, "jq");
   assert.equal(requests[0].payload.target_mode, "all");
+  assert.equal(requests[0].payload.discover, true);
   assert.equal(elements.deploy.disabled, false);
   elements.packages.value = "jq, htop";
   elements.packages.fire("input");
@@ -106,6 +109,17 @@ vm.runInNewContext(script, context);
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(elements["node-status"].textContent, "Inventory changed; refresh the node list.");
   delayed = null;
+  await elements.dry.fire("click");
+  assert.equal(elements.deploy.disabled, false);
+  elements.seed.value = "root@192.0.2.1";
+  elements.seed.fire("input");
+  assert.equal(elements.deploy.disabled, true);
+  assert.equal(elements["node-status"].textContent, "Discovery settings changed; refresh the node list.");
+  await elements.dry.fire("click");
+  assert.equal(requests.at(-1).payload.seed, "root@192.0.2.1");
+  elements.discover.checked = false;
+  elements.discover.fire("input");
+  assert.equal(elements.deploy.disabled, true);
   elements.packages.value = "";
   elements.packages.fire("input");
   assert.equal(elements.dry.disabled, true);

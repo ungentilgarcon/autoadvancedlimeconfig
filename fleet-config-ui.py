@@ -15,6 +15,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import fleet_file_deploy as deployment
+import fleet_mesh_discovery as mesh_discovery
 from fleet_archive import (
     MAX_ARCHIVE_BYTES,
     ArchiveError,
@@ -51,11 +52,18 @@ Backups can contain secrets.</p>
 <input id="packages" type="text" placeholder="package-one, package-two"></label>
 <p>For package-only deployments, enter packages and run the dry run without uploading backups.
 The node's package manager installs required dependencies from its configured repositories.</p>
-<label>Fleet inventory <input id="inventory" type="text" value="fleet-inventory.json" required></label>
+<label>Fleet inventory (optional if a mesh seed is provided)
+<input id="inventory" type="text" value="fleet-inventory.json"></label>
+<label><input id="discover" type="checkbox" checked> Automatically discover mesh routers</label>
+<label>Mesh seed SSH host (optional when inventory has a reachable seed)
+<input id="seed" type="text" placeholder="root@192.0.2.1"></label>
+<p>Discovery checks shared mesh DNS records, including non-router candidates. Only LibreMesh routers
+authenticated by SSH and matching their advertised hostname are added to deployment targets.
+Unknown SSH host keys must be verified separately.</p>
 <button id="refresh-nodes" type="button">Refresh available nodes</button>
 <p id="node-status" role="status"></p><div id="node-results"></div>
 <label>Target selection <select id="target-mode">
-<option value="all">All inventory nodes</option>
+<option value="all">All inventory and discovered routers</option>
 <option value="models">Models</option>
 <option value="nodes">Node names</option></select></label>
 <label>Models or node names (comma-separated)
@@ -72,11 +80,12 @@ const dry=document.getElementById("dry"), deploy=document.getElementById("deploy
 const originalInput=document.getElementById("original"), editedInput=document.getElementById("edited");
 const packagesInput=document.getElementById("packages"), results=document.getElementById("results");
 const inventoryInput=document.getElementById("inventory"), targetMode=document.getElementById("target-mode");
+const discoverInput=document.getElementById("discover"), seedInput=document.getElementById("seed");
 const targetsInput=document.getElementById("targets"), nodeStatus=document.getElementById("node-status");
 const nodeResults=document.getElementById("node-results");
-let uploaded=null, planId=null, planNodes=[], changeCount=0, revision=0, deploying=false;
+let uploaded=null, planId=null, planNodes=[], planExcluded=[], changeCount=0, revision=0, deploying=false;
 let nodeRevision=0;
-function invalidate(){revision++;planId=null;planNodes=[];deploy.disabled=true}
+function invalidate(){revision++;planId=null;planNodes=[];planExcluded=[];deploy.disabled=true}
 function updateDry(){dry.disabled=deploying||!uploaded||(!changeCount&&!uploaded.packages.trim())}
 function updatePackageOnly(){
 if(originalInput.files.length||editedInput.files.length)return false;
@@ -92,17 +101,18 @@ async function refreshNodes(){
 const version=++nodeRevision, inventory=inventoryInput.value.trim();
 nodeResults.replaceChildren();nodeStatus.textContent="Checking inventory nodes (read-only)...";
 try{
-const data=await post("nodes",{inventory});
+const data=await post("nodes",{inventory,discover:discoverInput.checked,seed:seedInput.value.trim()});
 if(version!==nodeRevision)return;
 const table=document.createElement("table"), header=document.createElement("tr");
-for(const name of ["Node","SSH host","Live model","Model ID","Status"]){
+for(const name of ["Node","Source","SSH host","Live model","Model ID","Status"]){
 const th=document.createElement("th");th.textContent=name;header.append(th)}table.append(header);
 for(const node of data.nodes){const row=document.createElement("tr");
-for(const value of [node.name,node.host,node.model||"-",node.model_id||"-",
+for(const value of [node.name,node.source||"inventory",node.host,node.model||"-",node.model_id||"-",
 node.status==="available"?"Available":node.error]){
 const cell=document.createElement("td");cell.textContent=value;row.append(cell)}table.append(row)}
-nodeResults.append(table);nodeStatus.textContent=data.nodes.length+" inventory nodes; "+
-data.nodes.filter(node=>node.status==="available").length+" reachable.";
+nodeResults.append(table);nodeStatus.textContent=data.nodes.length+" listed; "+
+data.nodes.filter(node=>node.status==="available").length+" verified or reachable. "+
+"Unverified discovered candidates are excluded from deployment.";
 }catch(error){if(version===nodeRevision)nodeStatus.textContent="Error: "+error.message}
 }
 document.getElementById("refresh-nodes").addEventListener("click",()=>{
@@ -126,6 +136,10 @@ input.addEventListener("change",()=>{invalidate();status.textContent=""})}
 inventoryInput.addEventListener("input",()=>{invalidate();status.textContent="";nodeRevision++;
 nodeResults.replaceChildren();nodeStatus.textContent="Inventory changed; refresh the node list."});
 inventoryInput.addEventListener("change",()=>refreshNodes());
+for(const input of [seedInput,discoverInput]){
+input.addEventListener("input",()=>{invalidate();status.textContent="";nodeRevision++;
+nodeResults.replaceChildren();nodeStatus.textContent="Discovery settings changed; refresh the node list."});
+input.addEventListener("change",()=>refreshNodes())}
 form.addEventListener("submit",async event=>{event.preventDefault();status.textContent="Comparing...";
 results.replaceChildren();uploaded=null;changeCount=0;updateDry();invalidate();const version=revision;
 try {
@@ -161,14 +175,18 @@ const selected=Array.from(document.querySelectorAll("#results input:checked"),it
 try{if(!uploaded||(!selected.length&&!uploaded.packages.trim()))throw new Error("Select files or enter packages");
 const result=await post("dry-run",{...uploaded,selected,
 inventory:inventoryInput.value,mode:document.getElementById("mode").value,
+discover:discoverInput.checked,seed:seedInput.value.trim(),
 target_mode:targetMode.value,targets:targetsInput.value});
 if(version!==revision)return;
-planId=result.plan_id;planNodes=result.nodes;deploy.disabled=false;
+planId=result.plan_id;planNodes=result.nodes;planExcluded=result.excluded_candidates||[];deploy.disabled=false;
 status.textContent="Dry run passed for: "+result.nodes.join(", ")+". No packages or configuration were applied."+
+(planExcluded.length?" Excluded unverified candidates: "+
+planExcluded.map(item=>item.name+" ("+item.error+")").join(", ")+".":"")+
 (result.package_managers.length?" Package managers: "+result.package_managers.join(", ")+".":"");
 }catch(error){if(version===revision)status.textContent="Error: "+error.message}});
 deploy.addEventListener("click",async()=>{if(!planId)return;
 const answer=prompt("This will change: "+planNodes.join(", ")+". It may disconnect the mesh. "+
+(planExcluded.length?"Unverified candidates excluded: "+planExcluded.map(item=>item.name).join(", ")+". ":"")+
 "Packages and their dependencies are not rolled back; partial installation may remain. "+
 "File rollback and synchronization are best effort. Type DEPLOY to proceed:");
 if(answer!=="DEPLOY")return;const id=planId;invalidate();deploying=true;updateDry();
@@ -239,6 +257,21 @@ def inspect_inventory(nodes: list) -> list[dict]:
     return [results[node.name] for node in nodes]
 
 
+def resolve_nodes(payload: dict, *, include_inventory_details: bool = True) -> tuple[list, list[dict]]:
+    discover = payload.get("discover", False)
+    seed = payload.get("seed", "")
+    inventory = payload.get("inventory")
+    if not isinstance(discover, bool) or not isinstance(seed, str) or not isinstance(inventory, str):
+        raise ArchiveError("Invalid discovery options")
+    if "\x00" in seed or "\x00" in inventory:
+        raise ArchiveError("Invalid discovery options")
+    if not discover:
+        nodes, _ = deployment.fleet.load_inventory(inventory_path(inventory))
+        return nodes, inspect_inventory(nodes) if include_inventory_details else []
+    nodes = mesh_discovery.load_inventory(deployment.fleet, inventory.strip())
+    return mesh_discovery.discover(deployment.fleet, nodes, seed.strip(), inspect_inventory)
+
+
 def select_targets(nodes: list, target_mode: object, targets: object) -> tuple[list, dict[str, str]]:
     if target_mode not in ("all", "nodes", "models") or not isinstance(targets, str):
         raise ArchiveError("Invalid target selection")
@@ -272,15 +305,18 @@ def select_targets(nodes: list, target_mode: object, targets: object) -> tuple[l
     return [node for node in nodes if node.name in expected], expected
 
 
-def verify_target_boards(nodes: list, expected: dict[str, str]) -> None:
+def verify_target_boards(nodes: list, expected: dict[str, str], hostnames: dict[str, str] | None = None) -> None:
     if not expected:
         return
-    if {node.name for node in nodes} != expected.keys():
+    if not expected.keys() <= {node.name for node in nodes}:
         raise ArchiveError("Model-targeted plan no longer matches its selected nodes")
-    details = inspect_inventory(nodes)
+    details = inspect_inventory([node for node in nodes if node.name in expected])
     changed = [
         item["name"] for item in details
         if item["status"] != "available" or item["board"] != expected.get(item["name"])
+        or (hostnames is not None and item["name"] in hostnames
+            and (not isinstance(item.get("hostname"), str)
+                 or item["hostname"].lower() != hostnames[item["name"]].lower()))
     ]
     if changed:
         raise ArchiveError(
@@ -289,7 +325,7 @@ def verify_target_boards(nodes: list, expected: dict[str, str]) -> None:
 
 
 def make_handler(token: str):
-    plans: dict[str, tuple[float, list, str, dict[str, str]]] = {}
+    plans: dict[str, tuple[float, list, str, dict[str, str], dict[str, str]]] = {}
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: object) -> None:
@@ -338,13 +374,12 @@ def make_handler(token: str):
                     plan = plans.pop(plan_id, None)
                     if plan is None or time.monotonic() - plan[0] > 600:
                         raise ArchiveError("Dry run expired or was already used; run it again")
-                    verify_target_boards([item.node for item in plan[1]], plan[3])
+                    verify_target_boards([item.node for item in plan[1]], plan[3], plan[4])
                     result = {"change_id": deployment.deploy(plan[1], plan[2])}
                 elif action == "nodes":
-                    path = inventory_path(payload.get("inventory"))
                     deployment.fleet.load_passwords(deployment.fleet.dl.DEFAULT_PASS_FILE)
-                    nodes, _ = deployment.fleet.load_inventory(path)
-                    result = {"nodes": inspect_inventory(nodes)}
+                    _, details = resolve_nodes(payload)
+                    result = {"nodes": details}
                 else:
                     if not isinstance(payload.get("packages"), str):
                         raise ArchiveError("Invalid comparison request")
@@ -371,7 +406,6 @@ def make_handler(token: str):
                     else:
                         plans.clear()
                         selected = payload.get("selected")
-                        inventory = inventory_path(payload.get("inventory"))
                         mode = payload.get("mode")
                         if (not isinstance(selected, list) or (not selected and not packages)
                                 or any(not isinstance(path, str) for path in selected)
@@ -382,14 +416,30 @@ def make_handler(token: str):
                         if len(chosen) != len(selected):
                             raise ArchiveError("Selection includes files not in the comparison")
                         deployment.fleet.load_passwords(deployment.fleet.dl.DEFAULT_PASS_FILE)
-                        nodes, _ = deployment.fleet.load_inventory(inventory)
+                        nodes, details = resolve_nodes(payload, include_inventory_details=False)
                         nodes, expected = select_targets(
                             nodes, payload.get("target_mode", "all"), payload.get("targets", "")
                         )
+                        chosen_names = {node.name for node in nodes}
+                        expected.update({
+                            item["name"]: item["board"] for item in details
+                            if item.get("source") == "discovered" and item["status"] == "available"
+                            and item["name"] in chosen_names
+                        })
+                        expected_hostnames = {
+                            item["name"]: item["name"] for item in details
+                            if item.get("source") == "discovered" and item["status"] == "available"
+                            and item["name"] in chosen_names
+                        }
                         planned = deployment.preflight(nodes, chosen, tuple(packages))
                         plan_id = secrets.token_urlsafe(32)
-                        plans[plan_id] = (time.monotonic(), planned, mode, expected)
+                        plans[plan_id] = (time.monotonic(), planned, mode, expected, expected_hostnames)
                         result = {"plan_id": plan_id, "nodes": [node.name for node in nodes],
+                                  "excluded_candidates": [
+                                      {"name": item["name"], "error": item.get("error")}
+                                      for item in details
+                                      if item.get("source") == "discovered" and item["status"] != "available"
+                                  ],
                                   "package_managers": [
                                       f"{plan.node.name}: {plan.package_manager}"
                                       for plan in planned if plan.package_manager
