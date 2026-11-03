@@ -1,0 +1,256 @@
+#!/bin/sh
+
+STATE_DIR=${PICOT_RADIO_RECOVERY_STATE_DIR:-/var/run/picot-radio-recovery}
+BOARD_FILE=${PICOT_RADIO_RECOVERY_BOARD_FILE:-/tmp/sysinfo/board_name}
+INTERVAL=30
+FAILURES=3
+COOLDOWN=1800
+MAX_RESTARTS=4
+FAILURE_WINDOW=600
+MESH=wlan0-mesh
+VLAN=wlan0-mesh_17
+
+log() {
+	logger -t picot-radio-recovery "$*"
+}
+
+read_number() {
+	if [ -f "$STATE_DIR/$1" ]; then
+		value=$(cat "$STATE_DIR/$1") || return 1
+		case "$value" in ''|*[!0-9]*) log "Invalid state in $1"; return 1;; esac
+	else
+		value=0
+	fi
+}
+
+write_number() {
+	printf '%s\n' "$2" > "$STATE_DIR/$1"
+}
+
+clear_failures() {
+	write_number failures 0
+}
+
+radio_ready() {
+	status=$(ubus -t 10 call network.wireless status '{"device":"radio0"}') || {
+		log "Cannot read radio0 status"
+		return 1
+	}
+	radio_up=$(printf '%s\n' "$status" | jsonfilter -e '@.radio0.up') || {
+		log "Cannot parse radio0 status"
+		return 1
+	}
+	[ "$radio_up" = true ] || return 1
+	interfaces=$(printf '%s\n' "$status" | jsonfilter -e '@.radio0.interfaces[*].ifname') || {
+		log "Cannot parse radio0 interfaces"
+		return 1
+	}
+	printf '%s\n' "$interfaces" | grep -Fxq "$MESH" || return 1
+	iw dev "$MESH" info >/dev/null 2>&1 || return 1
+	peers=$(iw dev "$MESH" station dump) || {
+		log "Cannot inspect 2.4 GHz mesh peers"
+		return 1
+	}
+	printf '%s\n' "$peers" | grep -Eq 'mesh plink:[[:space:]]*ESTAB' || return 1
+	ip link show dev "$VLAN" >/dev/null 2>&1 || return 1
+}
+
+selected_next_hop() {
+	route=$(ip -4 route get 1.1.1.1 2>/dev/null) || return 1
+	set -- $route
+	[ "${1:-}" = 1.1.1.1 ] || return 1
+	next_hop=
+	device=
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+			via) [ "$#" -ge 2 ] || return 1; next_hop=$2; shift;;
+			dev) [ "$#" -ge 2 ] || return 1; device=$2; shift;;
+		esac
+		shift
+	done
+	case "$next_hop" in ''|*[!0-9.]*) return 1;; esac
+	[ "$device" = "$VLAN" ] || return 1
+	routes=$(ip -4 route show default proto babel) || {
+		log "Cannot inspect Babel default routes"
+		return 1
+	}
+	found=0
+	while IFS= read -r line; do
+		case "$line" in
+			"default via $next_hop dev $VLAN"|"default via $next_hop dev $VLAN "*) found=1;;
+		esac
+	done <<EOF
+$routes
+EOF
+	[ "$found" = 1 ]
+}
+
+resolve_peer() {
+	neighbors4=$(ip -4 neigh show to "$probe_hop" dev "$VLAN") || {
+		log "Cannot inspect IPv4 mesh neighbors"
+		return 1
+	}
+	mac=$(printf '%s\n' "$neighbors4" |
+		awk -v hop="$probe_hop" '$1 == hop { for (i = 2; i < NF; i++) if ($i == "lladdr") { print tolower($(i+1)); exit } }')
+	if [ -z "$mac" ] && [ -f "$STATE_DIR/mapped_hop" ] &&
+	   [ "$(cat "$STATE_DIR/mapped_hop")" = "$probe_hop" ] && [ -f "$STATE_DIR/peer_mac" ]; then
+		mac=$(cat "$STATE_DIR/peer_mac")
+	fi
+	printf '%s\n' "$mac" | grep -Eq '^([0-9a-f]{2}:){5}[0-9a-f]{2}$' || return 1
+	station=$(iw dev "$MESH" station get "$mac") || return 1
+	printf '%s\n' "$station" | grep -Eq 'mesh plink:[[:space:]]*ESTAB' || return 1
+	neighbors6=$(ip -6 neigh show dev "$VLAN") || {
+		log "Cannot inspect IPv6 mesh neighbors"
+		return 1
+	}
+	peer6=$(printf '%s\n' "$neighbors6" |
+		awk -v mac="$mac" '$1 ~ /^fe80:/ && $2 == "lladdr" && tolower($3) == mac { print tolower($1); exit }')
+	if [ -z "$peer6" ] && [ -f "$STATE_DIR/mapped_hop" ] &&
+	   [ "$(cat "$STATE_DIR/mapped_hop")" = "$probe_hop" ] &&
+	   [ -f "$STATE_DIR/peer_mac" ] && [ "$(cat "$STATE_DIR/peer_mac")" = "$mac" ] &&
+	   [ -f "$STATE_DIR/peer6" ]; then
+		peer6=$(cat "$STATE_DIR/peer6")
+	fi
+	printf '%s\n' "$peer6" | grep -Eq '^fe80:[0-9a-f:]+$' || return 1
+	if [ -f "$STATE_DIR/peer_mac" ] && [ "$(cat "$STATE_DIR/peer_mac")" != "$mac" ]; then
+		clear_failures || return 1
+	fi
+	if [ -f "$STATE_DIR/peer6" ] && [ "$(cat "$STATE_DIR/peer6")" != "$peer6" ]; then
+		clear_failures || return 1
+	fi
+	printf '%s\n' "$probe_hop" > "$STATE_DIR/mapped_hop" || return 1
+	printf '%s\n' "$mac" > "$STATE_DIR/peer_mac" || return 1
+	printf '%s\n' "$peer6" > "$STATE_DIR/peer6" || return 1
+	rm -f "$STATE_DIR/unmapped_reported"
+}
+
+restore_radio() {
+	if ubus -t 10 call network.wireless up '{"device":"radio0"}'; then
+		rm -f "$STATE_DIR/restore-radio0"
+		trap - EXIT HUP INT TERM
+		log "Requested radio0 startup"
+		return 0
+	fi
+	log "ERROR: could not bring radio0 up; will retry"
+	return 1
+}
+
+restart_radio() {
+	now=${uptime%%.*}
+	read_number restarts || return 1
+	restarts=$value
+	read_number last_restart || return 1
+	last_restart=$value
+	if [ "$restarts" -ge "$MAX_RESTARTS" ]; then
+		if [ ! -f "$STATE_DIR/limit_reported" ]; then
+			log "Restart limit reached; leaving radio0 unchanged until reboot"
+			: > "$STATE_DIR/limit_reported" || return 1
+		fi
+		return 0
+	fi
+	if [ "$restarts" -gt 0 ] && [ $((now - last_restart)) -lt "$COOLDOWN" ]; then
+		return 0
+	fi
+	write_number restarts $((restarts + 1)) || return 1
+	write_number last_restart "$now" || return 1
+	: > "$STATE_DIR/restore-radio0" || return 1
+	trap 'restore_radio' EXIT
+	trap 'exit 1' HUP INT TERM
+	log "Restarting radio0 after repeated failed probes to $next_hop"
+	if ! ubus -t 10 call network.wireless down '{"device":"radio0"}'; then
+		log "ERROR: could not bring radio0 down"
+		restore_radio
+		return 1
+	fi
+	sleep 5
+	restore_radio || return 1
+	clear_failures
+}
+
+check() {
+	[ "$(cat "$BOARD_FILE")" = aruba,ap-303 ] || {
+		log "Unsupported board; refusing to run"
+		return 1
+	}
+	if [ -f "$STATE_DIR/restore-radio0" ]; then
+		restore_radio
+		return $?
+	fi
+	enabled=$(uci -q get picot-radio-recovery.settings.enabled) || {
+		log "ERROR: missing enabled setting"
+		return 1
+	}
+	case "$enabled" in
+		0) clear_failures; return $?;;
+		1) ;;
+		*) log "ERROR: invalid enabled setting"; return 1;;
+	esac
+	read -r uptime idle < /proc/uptime || return 1
+	now=${uptime%%.*}
+	read_number last_failure || return 1
+	if [ "$value" -gt 0 ] && [ $((now - value)) -ge "$FAILURE_WINDOW" ]; then
+		clear_failures || return 1
+	fi
+	if ! radio_ready; then
+		clear_failures
+		return $?
+	fi
+	if ! selected_next_hop; then
+		return 0
+	fi
+	probe_hop=$next_hop
+	if ! resolve_peer; then
+		if [ ! -f "$STATE_DIR/unmapped_reported" ]; then
+			log "Cannot map the Babel next hop to an established IPv6 mesh peer; not restarting"
+			: > "$STATE_DIR/unmapped_reported" || return 1
+		fi
+		clear_failures
+		return $?
+	fi
+	if ping -6 -n -I "$VLAN" -c 2 -W 2 "$peer6" >/dev/null 2>&1; then
+		clear_failures
+		return $?
+	fi
+	for address in 1.1.1.1 9.9.9.9; do
+		if ping -n -c 1 -W 2 "$address" >/dev/null 2>&1; then
+			clear_failures
+			return $?
+		fi
+	done
+	if ! selected_next_hop || [ "$next_hop" != "$probe_hop" ]; then
+		clear_failures
+		return $?
+	fi
+	if [ -f "$STATE_DIR/next_hop" ] && [ "$(cat "$STATE_DIR/next_hop")" != "$probe_hop" ]; then
+		clear_failures || return 1
+	fi
+	printf '%s\n' "$probe_hop" > "$STATE_DIR/next_hop" || return 1
+	write_number last_failure "$now" || return 1
+	read_number failures || return 1
+	count=$value
+	if [ "$count" -lt "$FAILURES" ]; then
+		count=$((count + 1))
+		log "Failed mesh next-hop and Internet probes ($count/$FAILURES)"
+	fi
+	write_number failures "$count" || return 1
+	[ "$count" -ge "$FAILURES" ] || return 0
+	restart_radio
+}
+
+for command in uci ubus jsonfilter iw ip ping logger awk; do
+	command -v "$command" >/dev/null 2>&1 || {
+		echo "picot-radio-recovery: missing command: $command" >&2
+		exit 1
+	}
+done
+mkdir -p -m 700 "$STATE_DIR" || exit 1
+case "${1:-}" in
+	check) check;;
+	run)
+		while :; do
+			check || log "ERROR: recovery check failed"
+			sleep "$INTERVAL"
+		done
+		;;
+	*) echo "Usage: $0 run|check" >&2; exit 1;;
+esac

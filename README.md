@@ -395,7 +395,8 @@ Caveats (not yet tested on hardware; pilot on one node with console access):
    substitutions (including the Selector's ath10k changes for Aruba).
 5. Adds the editable packages in `firmware-selector-packages.txt` and any
    command-line packages.
-6. Requests the custom image from the Selector's configured ASU build service.
+6. Requests the image from the Selector's ASU build service, or builds locally
+   when private credentials, model fixes or custom defaults are included.
 7. Downloads the sysupgrade image and verifies the returned SHA-256.
 
 There was no separate saved Selector parameter file in this directory. The
@@ -476,6 +477,67 @@ The image and a `.build.json` metadata file are written under
 `firmware-output/`. The version in the example is illustrative; check Selector
 availability before pinning an old release.
 
+#### Per-model fixes
+
+Place files in `fixes/<target>/<subtarget>/<profile>/files/` to embed them
+automatically in matching firmware builds. For example, the Aruba AP-303
+directory is `fixes/ipq40xx/generic/aruba_ap-303/files/`. Redmi AX6000 ubootmod
+uses `fixes/mediatek/filogic/xiaomi_redmi-router-ax6000-ubootmod/files/`.
+The dry run lists matching paths; other models are unaffected. See
+[fixes/README.md](fixes/README.md) for safety and upgrade limitations.
+
+The `fixes/` directory is **not Git-ignored**; keep credentials and sensitive
+configuration outside the repository. To use a private directory with the
+same structure instead, pass `--fixes-dir /path/to/private-fixes` to `build`,
+`deploy`, or `fleet-libremesh.py firmware`. The selected directory replaces
+the default rather than merging with it, so it must contain all desired fixes.
+
+Overlays are built locally with ImageBuilder, not sent to ASU. GNU `gawk` and
+a matching ImageBuilder are required, as with
+`--inject-pass`. The build metadata records the embedded file paths and
+SHA-256 hashes. Embedding a file does not itself activate a fix; saved
+configuration may override image files during a configuration-preserving
+upgrade. The AP-303 overlay includes the experimental radio watchdog described
+below; test it on one node before wider deployment.
+
+#### AP-303 radio recovery
+
+AP-303 builds using the repository's default model fixes include an enabled
+`picot-radio-recovery` service and `/etc/config/picot-radio-recovery`. It
+monitors only the observed `radio0`/`wlan0-mesh_17` path. When an established
+mesh peer exists and Babel has selected that interface as the default route,
+it maps the IPv4 next hop to its established mesh peer and probes that peer's
+IPv6 link-local address and two public IP addresses every 30 seconds. After
+three failed checks against the same next hop, with no more than ten minutes
+between failures, it restarts **only radio0**. Checks on another selected
+route do not erase the failures, but no restart happens while that route is
+selected. A successful check, loss of all established peers, or a ten-minute
+gap resets the failure count. There is a 30-minute cooldown and a limit
+of four restart attempts per boot. A stop or failed restart triggers a
+best-effort attempt to bring the radio back up.
+
+The checks cannot distinguish every failed peer or upstream outage from a
+radio fault, and restarting interrupts 2.4 GHz clients and mesh links. This is
+an experimental recovery, not a proven fix for the underlying driver or peer
+problem. It does nothing without an established peer or a selected Babel
+default via `wlan0-mesh_17`, and does not monitor the 5 GHz radio. If Babel
+has switched to another route, the faulty link may remain undetected. The
+watchdog also declines to restart if it cannot map the next hop to an
+established IPv6 peer, for example if there is no usable neighbor entry and
+no mapping cached since boot. The public ICMP probes can be filtered, and
+rebooting resets the attempt limit.
+Review logs with `logread -e picot-radio-recovery`.
+
+To disable it persistently, run `uci set picot-radio-recovery.settings.enabled=0`,
+`uci commit picot-radio-recovery`, and `/etc/init.d/picot-radio-recovery stop`.
+Set `enabled` to `1`, commit, and start the service to re-enable it. The image
+contains a boot service link; the generated configure command also enables and
+starts the service if present, but respects the UCI `enabled` setting.
+An external `--fixes-dir` replaces these files, and prebuilt images are
+unchanged. A real AP-303 image was built and its watchdog files and boot link
+inspected; the watchdog and a configuration-preserving upgrade have not been
+tested on hardware.
+
 #### Embed Wi-Fi and mesh credentials locally
 
 To include the saved Aruba Wi-Fi and mesh credentials in a first-boot setup,
@@ -526,8 +588,8 @@ the root password. The network restart may disconnect your session; use local
 recovery access.
 This recovery command is only present in the rebuilt credentialed image.
 
-The build command can optionally send a first-boot UCI-defaults script to the
-Selector:
+The build command can optionally embed a first-boot UCI-defaults script using
+the local ImageBuilder:
 
 ```sh
 python3 deploy-libremesh.py build \
@@ -535,10 +597,10 @@ python3 deploy-libremesh.py build \
   --uci-defaults ./reviewed-firstboot.sh
 ```
 
-That script will execute on the device as part of first boot. Do not use
-unreviewed scripts here. Its contents are sent to the remote Selector/ASU
-service; never put credentials in this script. The deployment script does not
-provide an automatic firstboot VLAN conversion.
+That script is intended to execute on a clean first boot; it is not guaranteed
+to run when existing configuration is preserved. Do not use unreviewed
+scripts here. Its contents remain local and are not sent to Selector/ASU.
+The deployment script does not provide an automatic firstboot VLAN conversion.
 
 ### 3. Stage the image without flashing (recommended first device step)
 

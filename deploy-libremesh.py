@@ -26,6 +26,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 SELECTOR = "https://firmware-selector.libremesh.org"
 DEFAULT_EXTRAS_FILE = ROOT / "firmware-selector-packages.txt"
+MODEL_FIXES_DIR = ROOT / "fixes"
+RADIO_RECOVERY_INIT = Path("etc/init.d/picot-radio-recovery")
+RADIO_RECOVERY_SCRIPT = Path("usr/sbin/picot-radio-recovery")
+RADIO_RECOVERY_CONFIG = Path("etc/config/picot-radio-recovery")
+RADIO_RECOVERY_LINK = Path("etc/rc.d/S99picot-radio-recovery")
 DEFAULT_PASS_FILE = ROOT / ".pass"
 VLAN_SCRIPT = ROOT / "apply-libremesh-vlans.sh"
 VLAN_RECOVERY_SCRIPT = ROOT / "picot-vlan-recovery"
@@ -350,6 +355,54 @@ def list_devices(args: argparse.Namespace) -> None:
     print("Use the first column with --device (add --target if one id has several targets).")
 
 
+def model_fix_files(device: dict, fixes_dir: Path | None = None) -> list[tuple[Path, Path]]:
+    target = device["target"]
+    profile = device["profile"]
+    if not re.fullmatch(r"[a-z0-9_-]+/[a-z0-9_-]+", target) or not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9_.+-]*", profile
+    ):
+        raise DeployError("Invalid target or profile for model fixes")
+    root = fixes_dir if fixes_dir is not None else MODEL_FIXES_DIR
+    for component in (*target.split("/"), profile, "files"):
+        if root.is_symlink():
+            raise DeployError(f"Model fixes directory must not be a symlink: {root}")
+        root = root / component
+    if root.is_symlink():
+        raise DeployError(f"Model fixes directory must not be a symlink: {root}")
+    if not root.exists():
+        return []
+    if not root.is_dir():
+        raise DeployError(f"Model fixes path is not a directory: {root}")
+    files = []
+    for path in sorted(root.rglob("*")):
+        mode = path.lstat().st_mode
+        if stat.S_ISDIR(mode):
+            continue
+        if not stat.S_ISREG(mode) or mode & 0o7000:
+            raise DeployError(f"Unsupported model fix file or permissions: {path}")
+        files.append((path, path.relative_to(root)))
+    return files
+
+
+def has_radio_recovery(device: dict, fix_files: list[tuple[Path, Path]]) -> bool:
+    files = {relative: source for source, relative in fix_files}
+    components = {RADIO_RECOVERY_INIT, RADIO_RECOVERY_SCRIPT, RADIO_RECOVERY_CONFIG}
+    if not files.keys() & components:
+        return False
+    if (
+        device["target"] != "ipq40xx/generic"
+        or device["profile"] != "aruba_ap-303"
+        or not components <= files.keys()
+    ):
+        raise DeployError("Radio recovery requires all AP-303 overlay components")
+    for path in (RADIO_RECOVERY_INIT, RADIO_RECOVERY_SCRIPT):
+        if not files[path].stat().st_mode & 0o111:
+            raise DeployError(f"Radio recovery file is not executable: /{path}")
+    if RADIO_RECOVERY_LINK in files:
+        raise DeployError(f"Model fix conflicts with generated image file: /{RADIO_RECOVERY_LINK}")
+    return True
+
+
 def build_image(args: argparse.Namespace) -> Path | None:
     if args.inject_pass and args.uci_defaults:
         raise DeployError(
@@ -372,6 +425,13 @@ def build_image(args: argparse.Namespace) -> Path | None:
         )
     device = resolve_device(args.device, getattr(args, "target", None))
     overview, profile_index, profile = fetch_profile(config, version, device)
+    fixes_dir = getattr(args, "fixes_dir", None)
+    if fixes_dir is not None:
+        fixes_dir = fixes_dir.expanduser().absolute()
+        if not fixes_dir.is_dir():
+            raise DeployError(f"Model fixes directory not found: {fixes_dir}")
+    fix_files = model_fix_files(device, fixes_dir)
+    radio_recovery = has_radio_recovery(device, fix_files)
     packages = unique(
         list(profile_index.get("default_packages", []))
         + list(profile.get("device_packages", []))
@@ -422,14 +482,18 @@ def build_image(args: argparse.Namespace) -> Path | None:
         "repository_keys": config["repository_keys"],
         "repositories_mode": "append",
     }
+    custom_defaults = None
     if args.uci_defaults:
         defaults_path = Path(args.uci_defaults).expanduser().resolve()
         if not defaults_path.is_file():
             raise DeployError(f"UCI-defaults file not found: {defaults_path}")
-        defaults = defaults_path.read_text(encoding="utf-8")
-        if len(defaults) > 256_000:
+        custom_defaults = defaults_path.read_text(encoding="utf-8")
+        if len(custom_defaults) > 256_000:
             raise DeployError("UCI-defaults file is larger than 256 KB")
-        request["defaults"] = defaults
+
+    local_build = bool(args.inject_pass or args.uci_defaults or fix_files)
+    if local_build and getattr(args, "image_type", "sysupgrade") != "sysupgrade":
+        raise DeployError("Local builds with credentials, defaults or model fixes support sysupgrade images only")
 
     if args.dry_run:
         print(f"Selector stable release: {version}")
@@ -438,6 +502,16 @@ def build_image(args: argparse.Namespace) -> Path | None:
         print(f"OpenWrt packages: {' '.join(asu_packages) or '(none)'}")
         print(f"LibreMesh packages: {' '.join(lime_packages) or '(none)'}")
         print(f"Resolved repositories: {json.dumps(request['repositories'], sort_keys=True)}")
+        print(f"Model fixes directory: {fixes_dir or MODEL_FIXES_DIR}")
+        print(f"Model fix files: {len(fix_files)}")
+        for _, relative in fix_files:
+            print(f"  /{relative.as_posix()}")
+        if radio_recovery:
+            print(f"  /{RADIO_RECOVERY_LINK} -> ../init.d/picot-radio-recovery")
+        if local_build:
+            print("Build method: local ImageBuilder; custom files are not sent to ASU.")
+        else:
+            print("Build method: Firmware Selector ASU.")
         if args.inject_pass:
             values = read_equipment_pass(args.pass_file, require_vlan_keys=False)
             wifi_keys_from_pass(values)
@@ -452,14 +526,16 @@ def build_image(args: argparse.Namespace) -> Path | None:
         print("Dry run: no image build was requested.")
         return None
 
-    if args.inject_pass:
-        values = read_equipment_pass(args.pass_file, require_vlan_keys=False)
-        main_key, mesh_key = wifi_keys_from_pass(values)
-        hostname = ap_hostname_from_pass(values)
-        admin_password = openwrt_admin_password_from_pass(values)
-        admin_password_hash = (
-            hash_openwrt_admin_password(admin_password) if admin_password else ""
-        )
+    if local_build:
+        main_key = mesh_key = hostname = admin_password_hash = ""
+        if args.inject_pass:
+            values = read_equipment_pass(args.pass_file, require_vlan_keys=False)
+            main_key, mesh_key = wifi_keys_from_pass(values)
+            hostname = ap_hostname_from_pass(values)
+            admin_password = openwrt_admin_password_from_pass(values)
+            admin_password_hash = (
+                hash_openwrt_admin_password(admin_password) if admin_password else ""
+            )
         return build_local_image(
             args=args,
             config=config,
@@ -471,6 +547,8 @@ def build_image(args: argparse.Namespace) -> Path | None:
             mesh_key=mesh_key,
             hostname=hostname,
             admin_password_hash=admin_password_hash,
+            fix_files=fix_files,
+            custom_defaults=custom_defaults,
         )
 
     url = f"{config['asu_url']}/api/v1/build"
@@ -867,6 +945,10 @@ def build_lime_wifi_recovery(
             "lime-apply",
             "/etc/init.d/network restart",
             "wifi reload",
+            'if [ -x /usr/sbin/picot-radio-recovery ] && [ -x /etc/init.d/picot-radio-recovery ]; then',
+            "    /etc/init.d/picot-radio-recovery enable",
+            "    /etc/init.d/picot-radio-recovery restart",
+            "fi",
             'echo "LibreMesh Wi-Fi configuration applied."',
             "",
         ]
@@ -987,6 +1069,8 @@ def build_local_image(
     mesh_key: str,
     hostname: str,
     admin_password_hash: str,
+    fix_files: list[tuple[Path, Path]],
+    custom_defaults: str | None,
 ) -> Path:
     if not shutil.which("gawk"):
         raise DeployError(
@@ -1032,27 +1116,48 @@ def build_local_image(
 
     output_dir = args.output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="libremesh-pass-files-") as files_dir:
-        defaults_dir = Path(files_dir) / "etc" / "uci-defaults"
-        defaults_dir.mkdir(parents=True)
-        defaults_script = defaults_dir / "90zz-lime-wifi"
-        defaults_script.write_text(
-            build_lime_wifi_defaults(
-                main_key, mesh_key, hostname, admin_password_hash
-            ),
-            encoding="ascii",
-        )
-        defaults_script.chmod(0o700)
-        recovery_dir = Path(files_dir) / "usr" / "sbin"
-        recovery_dir.mkdir(parents=True)
-        recovery_script = recovery_dir / "autoadvancedlimeconfig-configure"
-        recovery_script.write_text(
-            build_lime_wifi_recovery(
-                main_key, mesh_key, hostname, admin_password_hash
-            ),
-            encoding="ascii",
-        )
-        recovery_script.chmod(0o700)
+    fix_metadata = []
+    with tempfile.TemporaryDirectory(prefix="libremesh-image-files-") as files_dir:
+        overlay = Path(files_dir)
+        for source, relative in fix_files:
+            destination = overlay / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+            fix_metadata.append({
+                "path": "/" + relative.as_posix(),
+                "sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
+            })
+
+        if has_radio_recovery(device, fix_files):
+            link = overlay / RADIO_RECOVERY_LINK
+            if link.exists() or link.is_symlink():
+                raise DeployError(f"Model fix conflicts with generated image file: /{RADIO_RECOVERY_LINK}")
+            link.parent.mkdir(parents=True, exist_ok=True)
+            link.symlink_to("../init.d/picot-radio-recovery")
+            fix_metadata.append({
+                "path": "/" + RADIO_RECOVERY_LINK.as_posix(),
+                "symlink": "../init.d/picot-radio-recovery",
+            })
+
+        def write_generated(relative: str, content: str) -> None:
+            destination = overlay / relative
+            if destination.exists() or destination.is_symlink():
+                raise DeployError(f"Model fix conflicts with generated image file: /{relative}")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(content, encoding="utf-8")
+            destination.chmod(0o700)
+
+        if args.inject_pass:
+            write_generated(
+                "etc/uci-defaults/90zz-lime-wifi",
+                build_lime_wifi_defaults(main_key, mesh_key, hostname, admin_password_hash),
+            )
+            write_generated(
+                "usr/sbin/autoadvancedlimeconfig-configure",
+                build_lime_wifi_recovery(main_key, mesh_key, hostname, admin_password_hash),
+            )
+        if custom_defaults is not None:
+            write_generated("etc/uci-defaults/99-custom-defaults", custom_defaults)
         command = [
             "make",
             "-j2",
@@ -1062,9 +1167,11 @@ def build_local_image(
             f"FILES={files_dir}",
         ]
         print("Building locally with the matching OpenWrt ImageBuilder.")
-        print("Wi-Fi and mesh credentials stay local; do not share the resulting image.")
-        if admin_password_hash:
-            print("The OpenWrt root password is embedded as a hash.")
+        print("Custom image files stay local; do not share sensitive images.")
+        if args.inject_pass:
+            print("Wi-Fi and mesh credentials stay local; do not share the resulting image.")
+            if admin_password_hash:
+                print("The OpenWrt root password is embedded as a hash.")
         try:
             result = subprocess.run(
                 command,
@@ -1100,7 +1207,8 @@ def build_local_image(
         )
     image_name = candidates[0].name
     suffix = candidates[0].suffix
-    output = output_dir / f"{image_name.removesuffix(suffix)}-with-pass{suffix}"
+    label = "with-pass" if args.inject_pass else "custom"
+    output = output_dir / f"{image_name.removesuffix(suffix)}-{label}{suffix}"
     temporary = output.with_suffix(output.suffix + ".part")
     shutil.copyfile(candidates[0], temporary)
     temporary.chmod(0o600)
@@ -1117,15 +1225,21 @@ def build_local_image(
         "image": output.name,
         "sha256": digest,
         "build_method": "local ImageBuilder",
-        "credentials_embedded": True,
+        "credentials_embedded": bool(args.inject_pass),
+        "model_fixes": fix_metadata,
+        "custom_defaults_sha256": (
+            hashlib.sha256(custom_defaults.encode("utf-8")).hexdigest()
+            if custom_defaults is not None else None
+        ),
         "imagebuilder_url": imagebuilder_url,
     }
     metadata_path = output_dir / f"{output.name}.build.json"
     metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     metadata_path.chmod(0o600)
-    print(f"Built local image with first-boot LibreMesh Wi-Fi settings: {output}")
+    print(f"Built local image: {output}")
     print(f"SHA-256: {digest}")
-    print("The image contains readable network credentials; keep it private.")
+    if args.inject_pass:
+        print("The image contains readable network credentials; keep it private.")
     return output
 
 
@@ -1471,6 +1585,11 @@ def add_build_options(parser: argparse.ArgumentParser) -> None:
         help="Use an already extracted, matching ImageBuilder instead of downloading it",
     )
     parser.add_argument(
+        "--fixes-dir",
+        type=Path,
+        help="Use an alternate model fixes directory instead of the repository's fixes/",
+    )
+    parser.add_argument(
         "--target",
         help="Build target such as ipq40xx/generic; only needed if the profile "
         "exists for several targets",
@@ -1495,7 +1614,7 @@ def add_build_options(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--uci-defaults",
-        help="Optional first-boot UCI-defaults script sent to the Selector build",
+        help="Optional first-boot UCI-defaults script embedded by local ImageBuilder",
     )
     parser.add_argument(
         "--build-timeout",

@@ -457,7 +457,8 @@ def cmd_firmware(args: argparse.Namespace) -> int:
             device=device_name, target=None, version=args.version, feed_branch=args.feed_branch,
             dry_run=args.dry_run, build_timeout=args.build_timeout, image_type="sysupgrade",
             output_dir=args.output_dir, extra_packages=None, no_default_extra_packages=False,
-            imagebuilder_dir=args.imagebuilder_dir, pass_file=None, inject_pass=False,
+            imagebuilder_dir=args.imagebuilder_dir, fixes_dir=getattr(args, "fixes_dir", None),
+            pass_file=None, inject_pass=False,
             uci_defaults=None, list_devices=None, host=None, flash=False)
         path = dl.build_image(build_args)
         if path is not None:
@@ -650,6 +651,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="DEVICE=PATH prebuilt image instead of building (repeatable)")
     p.add_argument("--output-dir", type=Path, default=ROOT / "firmware-output")
     p.add_argument("--imagebuilder-dir", type=Path, default=None)
+    p.add_argument("--fixes-dir", type=Path, default=None,
+                   help="alternate model fixes directory for images built locally")
     p.add_argument("--build-timeout", type=int, default=3600)
     p.add_argument("--reboot-timeout", type=int, default=600)
     p.add_argument("--settle", type=int, default=300)
