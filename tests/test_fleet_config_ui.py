@@ -1,6 +1,7 @@
 import base64
 import importlib.util
 import json
+import subprocess
 import threading
 import unittest
 import urllib.error
@@ -147,6 +148,185 @@ class WebTests(unittest.TestCase):
                 self.post("dry-run", payload)
             self.assertEqual(error.exception.code, 400)
             preflight.assert_not_called()
+
+    def test_inventory_lists_live_models_and_unavailable_nodes(self):
+        nodes = [
+            ui.deployment.fleet.Node({"name": "a", "host": "root@192.0.2.1"}),
+            ui.deployment.fleet.Node({"name": "b", "host": "root@192.0.2.2"}),
+        ]
+
+        def remote(node, command, timeout):
+            self.assertEqual(command, "ubus call system board")
+            if node.name == "a":
+                return subprocess.CompletedProcess([], 0, json.dumps({
+                    "hostname": "ap-a", "board_name": "aruba,ap-303", "model": "Aruba AP-303",
+                }), "")
+            return subprocess.CompletedProcess([], 255, "", "host unreachable")
+
+        with patch.object(ui.deployment.fleet, "load_passwords"), \
+             patch.object(ui.deployment.fleet, "load_inventory", return_value=(nodes, {})), \
+             patch.object(ui.deployment.fleet, "remote", side_effect=remote):
+            with self.post("nodes", {"inventory": "inventory.json"}) as response:
+                details = json.load(response)["nodes"]
+        self.assertEqual([item["name"] for item in details], ["a", "b"])
+        self.assertEqual(details[0]["status"], "available")
+        self.assertEqual(details[0]["model"], "Aruba AP-303")
+        self.assertEqual(details[0]["model_id"], "aruba_ap-303")
+        self.assertEqual(details[0]["board"], "aruba,ap-303")
+        self.assertEqual(details[1]["status"], "unavailable")
+        self.assertIn("host unreachable", details[1]["error"])
+        self.assertIsNone(details[1]["model_id"])
+
+    def test_node_selection_limits_preflight_and_deploy(self):
+        nodes = [
+            ui.deployment.fleet.Node({"name": name, "host": f"root@192.0.2.{i}", "mesh_ip": f"192.0.2.{i}"})
+            for i, name in enumerate(("a", "b", "c"), 1)
+        ]
+        plans = [ui.deployment.NodePlan(node, (), ("nano",), "apk") for node in (nodes[0], nodes[2])]
+        payload = {"original": None, "edited": None, "packages": "nano", "selected": [],
+                   "inventory": "inventory.json", "mode": "none",
+                   "target_mode": "nodes", "targets": "a, c"}
+        with patch.object(ui.deployment.fleet, "load_passwords"), \
+             patch.object(ui.deployment.fleet, "load_inventory", return_value=(nodes, {})), \
+             patch.object(ui.deployment, "preflight", return_value=plans) as preflight, \
+             patch.object(ui.deployment, "deploy", return_value="web-id") as deploy:
+            with self.post("dry-run", payload) as response:
+                result = json.load(response)
+            self.assertEqual(result["nodes"], ["a", "c"])
+            preflight.assert_called_once_with([nodes[0], nodes[2]], [], ("nano",))
+            with self.post("deploy", {"plan_id": result["plan_id"], "confirmation": "DEPLOY"}):
+                pass
+            deploy.assert_called_once_with(plans, "none")
+
+    def test_model_selection_uses_live_board_and_revalidates_before_deploy(self):
+        nodes = [
+            ui.deployment.fleet.Node({"name": "a", "host": "root@192.0.2.1", "device": "wrong"}),
+            ui.deployment.fleet.Node({"name": "b", "host": "root@192.0.2.2", "device": "aruba_ap-303"}),
+            ui.deployment.fleet.Node({"name": "c", "host": "root@192.0.2.3"}),
+        ]
+        boards = {"a": "aruba,ap-303", "b": "xiaomi,redmi-router-ax6000-ubootmod",
+                  "c": "aruba,ap-303"}
+
+        def remote(node, command, timeout):
+            return subprocess.CompletedProcess([], 0, json.dumps({
+                "model": "Live model", "board_name": boards[node.name],
+            }), "")
+
+        payload = {"original": None, "edited": None, "packages": "nano", "selected": [],
+                   "inventory": "inventory.json", "mode": "none",
+                   "target_mode": "models", "targets": "aruba_ap-303"}
+        with patch.object(ui.deployment.fleet, "load_passwords"), \
+             patch.object(ui.deployment.fleet, "load_inventory", return_value=(nodes, {})), \
+             patch.object(ui.deployment.fleet, "remote", side_effect=remote), \
+             patch.object(ui.deployment, "preflight", side_effect=lambda chosen, *_: [
+                 ui.deployment.NodePlan(node, (), ("nano",), "apk") for node in chosen
+             ]) as preflight, \
+             patch.object(ui.deployment, "deploy", return_value="web-id") as deploy:
+            with self.post("dry-run", payload) as response:
+                result = json.load(response)
+            self.assertEqual(result["nodes"], ["a", "c"])
+            preflight.assert_called_once_with([nodes[0], nodes[2]], [], ("nano",))
+            boards["c"] = "different,model"
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                self.post("deploy", {"plan_id": result["plan_id"], "confirmation": "DEPLOY"})
+            self.assertIn("Cannot verify selected model", error.exception.read().decode())
+            deploy.assert_not_called()
+            with self.post("dry-run", payload) as response:
+                result = json.load(response)
+            boards["c"] = "aruba,ap-303"
+            # The second plan selected only a; c is not silently added after the dry run.
+            with self.post("deploy", {"plan_id": result["plan_id"], "confirmation": "DEPLOY"}):
+                pass
+            self.assertEqual([plan.node.name for plan in deploy.call_args.args[0]], ["a"])
+
+    def test_invalid_and_incomplete_selection_never_preflights(self):
+        nodes = [
+            ui.deployment.fleet.Node({"name": "a", "host": "root@192.0.2.1"}),
+            ui.deployment.fleet.Node({"name": "b", "host": "root@192.0.2.2"}),
+        ]
+        payload = {"original": None, "edited": None, "packages": "nano", "selected": [],
+                   "inventory": "inventory.json", "mode": "none"}
+        details = [
+            {"name": "a", "status": "available", "model_id": "aruba_ap-303", "board": "aruba,ap-303"},
+            {"name": "b", "status": "unavailable"},
+        ]
+        with patch.object(ui.deployment.fleet, "load_passwords"), \
+             patch.object(ui.deployment.fleet, "load_inventory", return_value=(nodes, {})), \
+             patch.object(ui, "inspect_inventory", return_value=details), \
+             patch.object(ui.deployment, "preflight") as preflight:
+            for mode, targets in (("nodes", ""), ("nodes", "a,missing"),
+                                  ("nodes", "a,a"), ("nodes", "a,"),
+                                  ("models", "aruba_ap-303"), ("all", "a"),
+                                  ("invalid", "a")):
+                with self.subTest(mode=mode, targets=targets):
+                    with self.assertRaises(urllib.error.HTTPError):
+                        self.post("dry-run", {**payload, "target_mode": mode, "targets": targets})
+            preflight.assert_not_called()
+
+    def test_model_selection_rejects_unknown_and_ambiguous_ids(self):
+        nodes = [ui.deployment.fleet.Node({"name": name, "host": "root@192.0.2.1"}) for name in ("a", "b")]
+        details = [
+            {"name": "a", "status": "available", "model_id": "test_board", "board": "test,board"},
+            {"name": "b", "status": "available", "model_id": "test_board", "board": "test_board"},
+        ]
+        with patch.object(ui, "inspect_inventory", return_value=details):
+            with self.assertRaisesRegex(ui.ArchiveError, "Unknown model"):
+                ui.select_targets(nodes, "models", "missing")
+            with self.assertRaisesRegex(ui.ArchiveError, "Ambiguous model"):
+                ui.select_targets(nodes, "models", "test_board")
+
+    def test_multiple_model_ids_select_only_matching_nodes(self):
+        nodes = [ui.deployment.fleet.Node({"name": name, "host": "root@192.0.2.1"})
+                 for name in ("a", "b", "c", "d")]
+        details = [
+            {"name": name, "status": "available", "model_id": model, "board": board}
+            for name, model, board in (
+                ("a", "aruba_ap-303", "aruba,ap-303"),
+                ("b", "other_router", "other,router"),
+                ("c", "xiaomi_ax6000", "xiaomi,ax6000"),
+                ("d", "aruba_ap-303", "aruba,ap-303"),
+            )
+        ]
+        with patch.object(ui, "inspect_inventory", return_value=details):
+            selected, expected = ui.select_targets(nodes, "models", "aruba_ap-303, xiaomi_ax6000")
+        self.assertEqual([node.name for node in selected], ["a", "c", "d"])
+        self.assertEqual(expected, {"a": "aruba,ap-303", "c": "xiaomi,ax6000", "d": "aruba,ap-303"})
+
+    def test_selected_file_and_package_use_only_selected_node(self):
+        nodes = [ui.deployment.fleet.Node({"name": name, "host": f"root@192.0.2.{i}"})
+                 for i, name in enumerate(("a", "b"), 1)]
+        original = base64.b64encode(archive([("etc/config/a", b"old\n")])).decode()
+        edited = base64.b64encode(archive([("etc/config/a", b"new\n")])).decode()
+        payload = {"original": original, "edited": edited, "packages": "nano",
+                   "selected": ["/etc/config/a"], "inventory": "inventory.json", "mode": "none",
+                   "target_mode": "nodes", "targets": "b"}
+        plan = ui.deployment.NodePlan(nodes[1], (), ("nano",), "apk")
+        with patch.object(ui.deployment.fleet, "load_passwords"), \
+             patch.object(ui.deployment.fleet, "load_inventory", return_value=(nodes, {})), \
+             patch.object(ui.deployment, "preflight", return_value=[plan]) as preflight:
+            with self.post("dry-run", payload) as response:
+                self.assertEqual(json.load(response)["nodes"], ["b"])
+            chosen, changes, packages = preflight.call_args.args
+            self.assertEqual(chosen, [nodes[1]])
+            self.assertEqual([change.path for change in changes], ["etc/config/a"])
+            self.assertEqual(packages, ("nano",))
+
+    def test_live_board_inspection_surfaces_invalid_responses(self):
+        node = ui.deployment.fleet.Node({"name": "a", "host": "root@192.0.2.1"})
+        for stdout in ("not json", "[]", "{}", '{"model":"AP","board_name":"invalid/board"}'):
+            with self.subTest(stdout=stdout), \
+                 patch.object(ui.deployment.fleet, "remote",
+                              return_value=subprocess.CompletedProcess([], 0, stdout, "")):
+                details = ui.inspect_node(node)
+                self.assertEqual(details["status"], "unavailable")
+                self.assertTrue(details["error"])
+
+    def test_model_plan_revalidation_rejects_missing_selected_nodes(self):
+        node = ui.deployment.fleet.Node({"name": "a", "host": "root@192.0.2.1"})
+        with patch.object(ui, "inspect_inventory") as inspect, \
+             self.assertRaisesRegex(ui.ArchiveError, "no longer matches"):
+            ui.verify_target_boards([node], {"a": "aruba,ap-303", "b": "aruba,ap-303"})
+        inspect.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()

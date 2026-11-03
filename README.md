@@ -841,6 +841,26 @@ the local process/browser memory and are not written into the repository.
 The URL contains an access token; do not share it. The interface listens only
 on `127.0.0.1`.
 
+The UI reads the inventory and queries each listed node over SSH for its live
+OpenWrt model and board ID. Use **Refresh available nodes** after changing the
+inventory or when a node comes back online. Unreachable nodes and query errors
+are shown; this is not an automatic mesh scan or a deployment health check.
+SSH host keys must already be verified, and password access uses the fleet
+password settings described below.
+
+Choose **All inventory nodes** (the default), **Node names**, or **Models**.
+For node names and models, enter exact comma-separated values shown in the
+table, for example `ap-1, ap-2` or
+`aruba_ap-303, xiaomi_redmi-router-ax6000-ubootmod`. Model selection uses the
+displayed model ID derived from the live board ID, not the inventory's
+`device` field. Model targeting fails if any inventory node cannot be
+identified, so an unavailable matching node is not silently omitted. To
+target a partial fleet, explicitly select node names instead. Unknown,
+duplicate, or empty entries are rejected. Only the selected nodes are
+preflighted and deployed; their peer health checks likewise cover only the
+selected nodes. Model-targeted nodes are checked again before deployment, and
+a changed or unavailable board invalidates the plan.
+
 Select files and/or packages and an inventory, then choose **Dry run against
 nodes**. For package-only deployments, entering package names enables the
 dry run immediately; no backups or comparison step are needed. The dry run fetches

@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import re
 import secrets
 import sys
 import time
@@ -51,6 +52,14 @@ Backups can contain secrets.</p>
 <p>For package-only deployments, enter packages and run the dry run without uploading backups.
 The node's package manager installs required dependencies from its configured repositories.</p>
 <label>Fleet inventory <input id="inventory" type="text" value="fleet-inventory.json" required></label>
+<button id="refresh-nodes" type="button">Refresh available nodes</button>
+<p id="node-status" role="status"></p><div id="node-results"></div>
+<label>Target selection <select id="target-mode">
+<option value="all">All inventory nodes</option>
+<option value="models">Models</option>
+<option value="nodes">Node names</option></select></label>
+<label>Models or node names (comma-separated)
+<input id="targets" type="text" disabled placeholder="Use model IDs or node names shown above"></label>
 <label>Activation <select id="mode"><option value="reload">Reload configuration</option>
 <option value="none">Write files only (no reload)</option></select></label>
 <button type="submit">Compare backups</button></form>
@@ -62,8 +71,12 @@ const form=document.getElementById("form"), status=document.getElementById("stat
 const dry=document.getElementById("dry"), deploy=document.getElementById("deploy");
 const originalInput=document.getElementById("original"), editedInput=document.getElementById("edited");
 const packagesInput=document.getElementById("packages"), results=document.getElementById("results");
-let uploaded=null, planId=null, changeCount=0, revision=0, deploying=false;
-function invalidate(){revision++;planId=null;deploy.disabled=true}
+const inventoryInput=document.getElementById("inventory"), targetMode=document.getElementById("target-mode");
+const targetsInput=document.getElementById("targets"), nodeStatus=document.getElementById("node-status");
+const nodeResults=document.getElementById("node-results");
+let uploaded=null, planId=null, planNodes=[], changeCount=0, revision=0, deploying=false;
+let nodeRevision=0;
+function invalidate(){revision++;planId=null;planNodes=[];deploy.disabled=true}
 function updateDry(){dry.disabled=deploying||!uploaded||(!changeCount&&!uploaded.packages.trim())}
 function updatePackageOnly(){
 if(originalInput.files.length||editedInput.files.length)return false;
@@ -75,6 +88,30 @@ reader.readAsDataURL(file);});}
 async function post(path,payload){const response=await fetch(path,{method:"POST",
 headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
 const data=await response.json();if(!response.ok)throw new Error(data.error);return data}
+async function refreshNodes(){
+const version=++nodeRevision, inventory=inventoryInput.value.trim();
+nodeResults.replaceChildren();nodeStatus.textContent="Checking inventory nodes (read-only)...";
+try{
+const data=await post("nodes",{inventory});
+if(version!==nodeRevision)return;
+const table=document.createElement("table"), header=document.createElement("tr");
+for(const name of ["Node","SSH host","Live model","Model ID","Status"]){
+const th=document.createElement("th");th.textContent=name;header.append(th)}table.append(header);
+for(const node of data.nodes){const row=document.createElement("tr");
+for(const value of [node.name,node.host,node.model||"-",node.model_id||"-",
+node.status==="available"?"Available":node.error]){
+const cell=document.createElement("td");cell.textContent=value;row.append(cell)}table.append(row)}
+nodeResults.append(table);nodeStatus.textContent=data.nodes.length+" inventory nodes; "+
+data.nodes.filter(node=>node.status==="available").length+" reachable.";
+}catch(error){if(version===nodeRevision)nodeStatus.textContent="Error: "+error.message}
+}
+document.getElementById("refresh-nodes").addEventListener("click",()=>{
+invalidate();status.textContent="";refreshNodes()});
+targetMode.addEventListener("change",()=>{
+targetsInput.disabled=targetMode.value==="all";
+if(targetsInput.disabled)targetsInput.value="";
+invalidate();status.textContent=""});
+targetsInput.addEventListener("input",()=>{invalidate();status.textContent=""});
 packagesInput.addEventListener("input",()=>{invalidate();status.textContent="";
 if(updatePackageOnly())return;
 if(uploaded){uploaded.packages=packagesInput.value;updateDry();
@@ -84,9 +121,11 @@ if(summary)summary.textContent="Requested packages: "+(packagesInput.value.trim(
 for(const input of [originalInput,editedInput])input.addEventListener("change",()=>{
 invalidate();uploaded=null;changeCount=0;results.replaceChildren();status.textContent="";
 if(!updatePackageOnly())updateDry()});
-for(const input of [document.getElementById("inventory"),document.getElementById("mode")]){
+for(const input of [document.getElementById("mode")]){
 input.addEventListener("change",()=>{invalidate();status.textContent=""})}
-document.getElementById("inventory").addEventListener("input",()=>{invalidate();status.textContent=""});
+inventoryInput.addEventListener("input",()=>{invalidate();status.textContent="";nodeRevision++;
+nodeResults.replaceChildren();nodeStatus.textContent="Inventory changed; refresh the node list."});
+inventoryInput.addEventListener("change",()=>refreshNodes());
 form.addEventListener("submit",async event=>{event.preventDefault();status.textContent="Comparing...";
 results.replaceChildren();uploaded=null;changeCount=0;updateDry();invalidate();const version=revision;
 try {
@@ -116,19 +155,20 @@ const cell=document.createElement("td");cell.textContent=value;row.append(cell)}
 results.append(table);updateDry();
 }catch(error){if(version===revision)status.textContent="Error: "+error.message}
 });
-dry.addEventListener("click",async()=>{invalidate();status.textContent="Checking every node (read-only)...";
+dry.addEventListener("click",async()=>{invalidate();status.textContent="Checking selected nodes (read-only)...";
 const version=revision;
 const selected=Array.from(document.querySelectorAll("#results input:checked"),item=>item.value);
 try{if(!uploaded||(!selected.length&&!uploaded.packages.trim()))throw new Error("Select files or enter packages");
 const result=await post("dry-run",{...uploaded,selected,
-inventory:document.getElementById("inventory").value,mode:document.getElementById("mode").value});
+inventory:inventoryInput.value,mode:document.getElementById("mode").value,
+target_mode:targetMode.value,targets:targetsInput.value});
 if(version!==revision)return;
-planId=result.plan_id;deploy.disabled=false;
+planId=result.plan_id;planNodes=result.nodes;deploy.disabled=false;
 status.textContent="Dry run passed for: "+result.nodes.join(", ")+". No packages or configuration were applied."+
 (result.package_managers.length?" Package managers: "+result.package_managers.join(", ")+".":"");
 }catch(error){if(version===revision)status.textContent="Error: "+error.message}});
 deploy.addEventListener("click",async()=>{if(!planId)return;
-const answer=prompt("This will change all listed nodes and may disconnect the mesh. "+
+const answer=prompt("This will change: "+planNodes.join(", ")+". It may disconnect the mesh. "+
 "Packages and their dependencies are not rolled back; partial installation may remain. "+
 "File rollback and synchronization are best effort. Type DEPLOY to proceed:");
 if(answer!=="DEPLOY")return;const id=planId;invalidate();deploying=true;updateDry();
@@ -137,6 +177,7 @@ try{const result=await post("deploy",{plan_id:id,confirmation:answer});
 status.textContent="Deployment completed on all nodes. Change ID: "+result.change_id;
 }catch(error){status.textContent="Deployment failed: "+error.message}
 finally{deploying=false;updateDry()}});
+refreshNodes();
 </script></body></html>"""
 
 
@@ -149,8 +190,106 @@ def decode_archive(value: object) -> bytes:
         raise ArchiveError("Backup is not valid base64") from error
 
 
+def inventory_path(value: object) -> Path:
+    if not isinstance(value, str) or not value.strip() or "\x00" in value:
+        raise ArchiveError("Invalid inventory path")
+    return Path(value)
+
+
+def inspect_node(node) -> dict:
+    result = {
+        "name": node.name, "host": node.host, "status": "unavailable",
+        "model": None, "model_id": None, "board": None, "hostname": None,
+        "error": None,
+    }
+    try:
+        response = deployment.fleet.remote(node, "ubus call system board", timeout=20)
+    except (deployment.fleet.DeployError, OSError) as error:
+        result["error"] = str(error)
+        return result
+    if response.returncode:
+        result["error"] = (response.stderr.strip() or "SSH or board query failed")[:300]
+        return result
+    try:
+        board = json.loads(response.stdout)
+    except (ValueError, TypeError):
+        result["error"] = "Invalid board response"
+        return result
+    if not isinstance(board, dict) or not all(
+        isinstance(board.get(field), str) and board[field].strip()
+        for field in ("board_name", "model")
+    ):
+        result["error"] = "Board response is missing model or board_name"
+        return result
+    board_name = board["board_name"].strip()
+    model_id = deployment.fleet.dl.normalize_board(board_name)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.+-]*", model_id):
+        result["error"] = "Board response has an invalid model ID"
+        return result
+    hostname = board.get("hostname")
+    result.update(
+        status="available", model=board["model"].strip(), model_id=model_id,
+        board=board_name, hostname=hostname if isinstance(hostname, str) else None,
+    )
+    return result
+
+
+def inspect_inventory(nodes: list) -> list[dict]:
+    results = deployment.fleet.parallel(nodes, inspect_node)
+    return [results[node.name] for node in nodes]
+
+
+def select_targets(nodes: list, target_mode: object, targets: object) -> tuple[list, dict[str, str]]:
+    if target_mode not in ("all", "nodes", "models") or not isinstance(targets, str):
+        raise ArchiveError("Invalid target selection")
+    if target_mode == "all":
+        if targets.strip():
+            raise ArchiveError("Clear the target list when selecting all nodes")
+        return nodes, {}
+    values = [value.strip() for value in targets.split(",")]
+    if any(not value for value in values) or len(values) != len(set(values)):
+        raise ArchiveError("Enter distinct comma-separated target names or model IDs")
+    if target_mode == "nodes":
+        return deployment.fleet.select_nodes(nodes, values), {}
+
+    details = inspect_inventory(nodes)
+    unavailable = [item["name"] for item in details if item["status"] != "available"]
+    if unavailable:
+        raise ArchiveError(
+            "Cannot select all matching models while inventory nodes are unavailable: "
+            + ", ".join(unavailable) + ". Use node-name selection for a partial fleet."
+        )
+    model_boards: dict[str, set[str]] = {}
+    for item in details:
+        model_boards.setdefault(item["model_id"], set()).add(item["board"])
+    unknown = set(values) - model_boards.keys()
+    if unknown:
+        raise ArchiveError("Unknown model ID(s): " + ", ".join(sorted(unknown)))
+    ambiguous = [value for value in values if len(model_boards[value]) != 1]
+    if ambiguous:
+        raise ArchiveError("Ambiguous model ID(s): " + ", ".join(ambiguous))
+    expected = {item["name"]: item["board"] for item in details if item["model_id"] in values}
+    return [node for node in nodes if node.name in expected], expected
+
+
+def verify_target_boards(nodes: list, expected: dict[str, str]) -> None:
+    if not expected:
+        return
+    if {node.name for node in nodes} != expected.keys():
+        raise ArchiveError("Model-targeted plan no longer matches its selected nodes")
+    details = inspect_inventory(nodes)
+    changed = [
+        item["name"] for item in details
+        if item["status"] != "available" or item["board"] != expected.get(item["name"])
+    ]
+    if changed:
+        raise ArchiveError(
+            "Cannot verify selected model on: " + ", ".join(changed) + "; run a new dry run"
+        )
+
+
 def make_handler(token: str):
-    plans: dict[str, tuple[float, list, str]] = {}
+    plans: dict[str, tuple[float, list, str, dict[str, str]]] = {}
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: object) -> None:
@@ -177,7 +316,7 @@ def make_handler(token: str):
 
         def do_POST(self) -> None:
             action = self.path.removeprefix(f"/{token}/")
-            if self.path != f"/{token}/{action}" or action not in ("compare", "dry-run", "deploy"):
+            if self.path != f"/{token}/{action}" or action not in ("nodes", "compare", "dry-run", "deploy"):
                 self.reply(404, b"Not found", "text/plain")
                 return
             origin = self.headers.get("Origin")
@@ -199,7 +338,13 @@ def make_handler(token: str):
                     plan = plans.pop(plan_id, None)
                     if plan is None or time.monotonic() - plan[0] > 600:
                         raise ArchiveError("Dry run expired or was already used; run it again")
+                    verify_target_boards([item.node for item in plan[1]], plan[3])
                     result = {"change_id": deployment.deploy(plan[1], plan[2])}
+                elif action == "nodes":
+                    path = inventory_path(payload.get("inventory"))
+                    deployment.fleet.load_passwords(deployment.fleet.dl.DEFAULT_PASS_FILE)
+                    nodes, _ = deployment.fleet.load_inventory(path)
+                    result = {"nodes": inspect_inventory(nodes)}
                 else:
                     if not isinstance(payload.get("packages"), str):
                         raise ArchiveError("Invalid comparison request")
@@ -226,22 +371,24 @@ def make_handler(token: str):
                     else:
                         plans.clear()
                         selected = payload.get("selected")
-                        inventory = payload.get("inventory")
+                        inventory = inventory_path(payload.get("inventory"))
                         mode = payload.get("mode")
                         if (not isinstance(selected, list) or (not selected and not packages)
                                 or any(not isinstance(path, str) for path in selected)
                                 or len(set(selected)) != len(selected)
-                                or not isinstance(inventory, str) or not inventory
-                                or "\x00" in inventory or mode not in ("none", "reload")):
+                                or mode not in ("none", "reload")):
                             raise ArchiveError("Invalid dry-run options")
                         chosen = [change for change in changes if "/" + change.path in selected]
                         if len(chosen) != len(selected):
                             raise ArchiveError("Selection includes files not in the comparison")
                         deployment.fleet.load_passwords(deployment.fleet.dl.DEFAULT_PASS_FILE)
-                        nodes, _ = deployment.fleet.load_inventory(Path(inventory))
+                        nodes, _ = deployment.fleet.load_inventory(inventory)
+                        nodes, expected = select_targets(
+                            nodes, payload.get("target_mode", "all"), payload.get("targets", "")
+                        )
                         planned = deployment.preflight(nodes, chosen, tuple(packages))
                         plan_id = secrets.token_urlsafe(32)
-                        plans[plan_id] = (time.monotonic(), planned, mode)
+                        plans[plan_id] = (time.monotonic(), planned, mode, expected)
                         result = {"plan_id": plan_id, "nodes": [node.name for node in nodes],
                                   "package_managers": [
                                       f"{plan.node.name}: {plan.package_manager}"
