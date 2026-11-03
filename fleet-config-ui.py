@@ -53,7 +53,7 @@ Backups can contain secrets.</p>
 <p>For package-only deployments, enter packages and run the dry run without uploading backups.
 The node's package manager installs required dependencies from its configured repositories.</p>
 <label>Fleet inventory (optional if a mesh seed is provided)
-<input id="inventory" type="text" value="fleet-inventory.json"></label>
+<input id="inventory" type="text" value="__DEFAULT_INVENTORY__" placeholder="fleet-inventory.json"></label>
 <label><input id="discover" type="checkbox" checked> Automatically discover mesh routers</label>
 <label>Mesh seed SSH host (optional when inventory has a reachable seed)
 <input id="seed" type="text" placeholder="root@192.0.2.1"></label>
@@ -99,9 +99,14 @@ headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
 const data=await response.json();if(!response.ok)throw new Error(data.error);return data}
 async function refreshNodes(){
 const version=++nodeRevision, inventory=inventoryInput.value.trim();
-nodeResults.replaceChildren();nodeStatus.textContent="Checking inventory nodes (read-only)...";
+const seed=seedInput.value.trim();
+nodeResults.replaceChildren();
+if(!inventory&&(!discoverInput.checked||!seed)){
+nodeStatus.textContent=discoverInput.checked?"Enter a mesh seed SSH host or an inventory path.":
+"Enter an inventory path.";return}
+nodeStatus.textContent="Checking inventory nodes (read-only)...";
 try{
-const data=await post("nodes",{inventory,discover:discoverInput.checked,seed:seedInput.value.trim()});
+const data=await post("nodes",{inventory,discover:discoverInput.checked,seed});
 if(version!==nodeRevision)return;
 const table=document.createElement("table"), header=document.createElement("tr");
 for(const name of ["Node","Source","SSH host","Live model","Model ID","Status"]){
@@ -348,7 +353,9 @@ def make_handler(token: str):
             if self.path != f"/{token}/":
                 self.reply(404, b"Not found", "text/plain")
                 return
-            self.reply(200, PAGE, "text/html; charset=utf-8")
+            default_inventory = b"fleet-inventory.json" if Path("fleet-inventory.json").exists() else b""
+            self.reply(200, PAGE.replace(b"__DEFAULT_INVENTORY__", default_inventory),
+                       "text/html; charset=utf-8")
 
         def do_POST(self) -> None:
             action = self.path.removeprefix(f"/{token}/")

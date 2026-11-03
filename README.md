@@ -844,8 +844,10 @@ on `127.0.0.1`.
 The UI queries nodes over SSH for their live OpenWrt model and board ID.
 Automatic mesh discovery is enabled by default. It reads LibreMesh shared DNS
 records from a reachable inventory node, or from the optional mesh seed SSH
-host. To use only a seed without an inventory, clear the inventory field and
-enter its SSH host (for example `root@10.100.159.52`). The seed's own hostname
+host. The inventory field is filled automatically only if
+`fleet-inventory.json` exists in the controller's current directory. To use
+only a seed without an inventory, leave the inventory field empty and enter
+its SSH host (for example `root@10.100.159.52`). The seed's own hostname
 must be present in shared DNS. The seed can use SSH keys or the shared
 `FLEET_SSH_PASSWORD`; an explicit seed uses the node-specific password key
 `FLEET_SSH_PASSWORD_MESH_SEED` if configured.

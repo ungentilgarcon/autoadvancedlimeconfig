@@ -2,6 +2,7 @@ import base64
 import importlib.util
 import json
 import subprocess
+import tempfile
 import threading
 import unittest
 import urllib.error
@@ -93,6 +94,25 @@ class WebTests(unittest.TestCase):
             headers={"Origin": self.origin, "Content-Type": "application/json"},
         )
         return urllib.request.urlopen(request)
+
+    def test_inventory_field_uses_default_only_if_it_exists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inventory = Path(directory) / "fleet-inventory.json"
+            with patch.object(ui, "Path", return_value=inventory):
+                with urllib.request.urlopen(self.origin + "/test-token/") as response:
+                    self.assertIn(b'id="inventory" type="text" value=""', response.read())
+                inventory.write_text('{"nodes":[]}', encoding="utf-8")
+                with urllib.request.urlopen(self.origin + "/test-token/") as response:
+                    self.assertIn(b'id="inventory" type="text" value="fleet-inventory.json"',
+                                  response.read())
+
+    def test_explicit_missing_inventory_is_reported_even_with_seed(self):
+        payload = {"inventory": "missing-inventory.json", "seed": "root@192.0.2.1",
+                   "discover": True}
+        with patch.object(ui.deployment.fleet, "load_passwords"):
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                self.post("nodes", payload)
+        self.assertIn("missing-inventory.json", error.exception.read().decode())
 
     def test_deploy_requires_dry_run_and_explicit_confirmation(self):
         original = base64.b64encode(archive([("etc/config/a", b"old\n")])).decode()
