@@ -104,11 +104,13 @@ For archive comparison, per-node dry runs and experimental deployment, run:
 
 Select changed files and/or comma-separated packages and an inventory with a
 distinct mesh_ip for each node, run the dry run, then type DEPLOY when prompted.
-Package-only deployments do not require backups. APK simulates dependencies
+Package-only deployments need no backups or comparison step. APK simulates dependencies
 using cached indexes; OPKG checks package availability only. Update indexes
 on the nodes first if needed. The dry run does not install packages or validate
 UCI syntax; UCI files are validated at staging. Packages and dependencies are
-installed before files and are not rolled back if anything fails. A failed or
+installed before files and are not rolled back if anything fails. APK and OPKG
+automatically retrieve required dependencies from their configured repositories.
+A failed or
 timed-out install can be partial or still running. Nodes need flock.
 Scheduling and confirmation are best effort, not atomic;
 partial confirmation or lost nodes can require manual recovery. Health checks

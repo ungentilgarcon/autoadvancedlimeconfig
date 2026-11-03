@@ -48,6 +48,8 @@ Backups can contain secrets.</p>
 <label>Edited .tar.gz backup <input id="edited" type="file" accept=".gz,.tgz"></label>
 <label>Packages to install (comma-separated)
 <input id="packages" type="text" placeholder="package-one, package-two"></label>
+<p>For package-only deployments, enter packages and run the dry run without uploading backups.
+The node's package manager installs required dependencies from its configured repositories.</p>
 <label>Fleet inventory <input id="inventory" type="text" value="fleet-inventory.json" required></label>
 <label>Activation <select id="mode"><option value="reload">Reload configuration</option>
 <option value="none">Write files only (no reload)</option></select></label>
@@ -58,61 +60,83 @@ Backups can contain secrets.</p>
 <script>
 const form=document.getElementById("form"), status=document.getElementById("status");
 const dry=document.getElementById("dry"), deploy=document.getElementById("deploy");
-let uploaded=null, planId=null;
-function invalidate(){planId=null;deploy.disabled=true}
+const originalInput=document.getElementById("original"), editedInput=document.getElementById("edited");
+const packagesInput=document.getElementById("packages"), results=document.getElementById("results");
+let uploaded=null, planId=null, changeCount=0, revision=0, deploying=false;
+function invalidate(){revision++;planId=null;deploy.disabled=true}
+function updateDry(){dry.disabled=deploying||!uploaded||(!changeCount&&!uploaded.packages.trim())}
+function updatePackageOnly(){
+if(originalInput.files.length||editedInput.files.length)return false;
+uploaded={original:null,edited:null,packages:packagesInput.value};changeCount=0;
+results.replaceChildren();updateDry();return true}
 function encoded(file){return new Promise((resolve,reject)=>{const reader=new FileReader();
 reader.onload=()=>resolve(reader.result.split(",",2)[1]);reader.onerror=()=>reject(reader.error);
 reader.readAsDataURL(file);});}
 async function post(path,payload){const response=await fetch(path,{method:"POST",
 headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
 const data=await response.json();if(!response.ok)throw new Error(data.error);return data}
-form.addEventListener("change",()=>{uploaded=null;dry.disabled=true;invalidate()});
+packagesInput.addEventListener("input",()=>{invalidate();status.textContent="";
+if(updatePackageOnly())return;
+if(uploaded){uploaded.packages=packagesInput.value;updateDry();
+const summary=document.getElementById("package-summary");
+if(summary)summary.textContent="Requested packages: "+(packagesInput.value.trim()||"none")}
+});
+for(const input of [originalInput,editedInput])input.addEventListener("change",()=>{
+invalidate();uploaded=null;changeCount=0;results.replaceChildren();status.textContent="";
+if(!updatePackageOnly())updateDry()});
+for(const input of [document.getElementById("inventory"),document.getElementById("mode")]){
+input.addEventListener("change",()=>{invalidate();status.textContent=""})}
+document.getElementById("inventory").addEventListener("input",()=>{invalidate();status.textContent=""});
 form.addEventListener("submit",async event=>{event.preventDefault();status.textContent="Comparing...";
-const results=document.getElementById("results");results.replaceChildren();dry.disabled=true;invalidate();
+results.replaceChildren();uploaded=null;changeCount=0;updateDry();invalidate();const version=revision;
 try {
-const original=document.getElementById("original").files[0];
-const edited=document.getElementById("edited").files[0];
+const original=originalInput.files[0], edited=editedInput.files[0];
 if(Boolean(original)!==Boolean(edited))throw new Error("Upload both backups or neither");
 if((original&&original.size>33554432)||(edited&&edited.size>33554432))
 throw new Error("Each archive must be at most 32 MiB");
-uploaded={original:original?await encoded(original):null,edited:edited?await encoded(edited):null,
-packages:document.getElementById("packages").value};
-const data=await post("compare",uploaded);
+const payload={original:original?await encoded(original):null,edited:edited?await encoded(edited):null,
+packages:packagesInput.value};
+if(version!==revision)return;
+const data=await post("compare",payload);
+if(version!==revision)return;
+uploaded=payload;changeCount=data.changes.length;
 status.textContent=data.changes.length+" changed files. No routers were contacted.";
-const p=document.createElement("p");p.textContent="Requested packages: "+
+const p=document.createElement("p");p.id="package-summary";p.textContent="Requested packages: "+
 (data.packages.length?data.packages.join(", "):"none");results.append(p);
 const table=document.createElement("table"), header=document.createElement("tr");
 for(const name of ["Select","File","Operation","Original mode","Edited mode","Lines added","Lines removed"]){
 const th=document.createElement("th");th.textContent=name;header.append(th)}table.append(header);
 for(const change of data.changes){const row=document.createElement("tr");
 const choice=document.createElement("input");choice.type="checkbox";choice.value=change.path;
-choice.addEventListener("change",invalidate);const select=document.createElement("td");
+choice.addEventListener("change",()=>{invalidate();status.textContent=""});const select=document.createElement("td");
 select.append(choice);row.append(select);
 for(const value of [change.path,change.operation,change.original_mode??"-",
 change.edited_mode??"-",change.added,change.removed]){
 const cell=document.createElement("td");cell.textContent=value;row.append(cell)}table.append(row)}
-results.append(table);dry.disabled=!data.changes.length&&!data.packages.length;
-}catch(error){status.textContent="Error: "+error.message}
+results.append(table);updateDry();
+}catch(error){if(version===revision)status.textContent="Error: "+error.message}
 });
 dry.addEventListener("click",async()=>{invalidate();status.textContent="Checking every node (read-only)...";
+const version=revision;
 const selected=Array.from(document.querySelectorAll("#results input:checked"),item=>item.value);
-try{if(!selected.length&&!uploaded.packages.trim())throw new Error("Select files or enter packages");
+try{if(!uploaded||(!selected.length&&!uploaded.packages.trim()))throw new Error("Select files or enter packages");
 const result=await post("dry-run",{...uploaded,selected,
 inventory:document.getElementById("inventory").value,mode:document.getElementById("mode").value});
+if(version!==revision)return;
 planId=result.plan_id;deploy.disabled=false;
 status.textContent="Dry run passed for: "+result.nodes.join(", ")+". No packages or configuration were applied."+
 (result.package_managers.length?" Package managers: "+result.package_managers.join(", ")+".":"");
-}catch(error){status.textContent="Error: "+error.message}});
+}catch(error){if(version===revision)status.textContent="Error: "+error.message}});
 deploy.addEventListener("click",async()=>{if(!planId)return;
 const answer=prompt("This will change all listed nodes and may disconnect the mesh. "+
 "Packages and their dependencies are not rolled back; partial installation may remain. "+
 "File rollback and synchronization are best effort. Type DEPLOY to proceed:");
-if(answer!=="DEPLOY")return;const id=planId;invalidate();dry.disabled=true;
+if(answer!=="DEPLOY")return;const id=planId;invalidate();deploying=true;updateDry();
 status.textContent="Deploying; keep this window open...";
 try{const result=await post("deploy",{plan_id:id,confirmation:answer});
 status.textContent="Deployment completed on all nodes. Change ID: "+result.change_id;
 }catch(error){status.textContent="Deployment failed: "+error.message}
-finally{dry.disabled=false}});
+finally{deploying=false;updateDry()}});
 </script></body></html>"""
 
 

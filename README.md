@@ -780,7 +780,8 @@ The URL contains an access token; do not share it. The interface listens only
 on `127.0.0.1`.
 
 Select files and/or packages and an inventory, then choose **Dry run against
-nodes**. Backups are optional for package-only deployments. The dry run fetches
+nodes**. For package-only deployments, entering package names enables the
+dry run immediately; no backups or comparison step are needed. The dry run fetches
 current files over SSH and checks whether each change can be merged without
 overwriting per-node differences. Every node needs a valid, distinct `mesh_ip`.
 Changed symlinks and special files are rejected.
@@ -801,6 +802,10 @@ stale files abort the change. The nodes must have `flock`, and the current
 file and UCI helpers serialize operations using a shared lock. Do not run
 older controller/helper versions concurrently. Changes under `/etc/config`
 are checked for UCI syntax during staging, not during the dry run.
+
+Each node's package manager automatically resolves and retrieves required
+dependencies from its configured repositories. Installation fails if it
+cannot obtain them; OPKG's dry run does not detect every such failure.
 
 **Package installation is not rolled back**, including dependencies, upgrades
 and package scripts. A failure or timeout may leave a partially installed or
@@ -968,6 +973,7 @@ The fleet-specific runners use isolated VM disks and SSH state:
 ```sh
 python3 emulator/run_fleet_scenarios.py --image /path/to/libremesh-x86.img
 python3 emulator/run_fleet_file_scenarios.py --image /path/to/libremesh-x86.img
+python3 emulator/run_fleet_one_package_scenario.py --image /path/to/libremesh-25.12-x86.img
 python3 emulator/run_fleet_package_scenarios.py \
   --apk-image /path/to/libremesh-25.12-x86.img \
   --opkg-image /path/to/openwrt-24.10-x86.img

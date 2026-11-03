@@ -1,5 +1,15 @@
 # Emulator test journal
 
+## 2026-11-03: package-only interface and dependencies
+
+- On one isolated LibreMesh/OpenWrt 25.12 QEMU node, a package-only dry run
+  left the package database unchanged. A confirmed deployment installed
+  `jq` and `git-http` and automatically pulled the initially absent `git`,
+  `libcurl4`, and `libnghttp2-14` dependencies.
+- A separate browser check used a mocked fleet backend: entering package names
+  enabled the dry run without backup uploads or comparison, and editing names
+  invalidated the previous deployment plan.
+
 ## 2026-11-03: APK and OPKG UI deployment
 
 - Exercised a mixed two-node QEMU fleet using LibreMesh/OpenWrt 25.12 APK and
