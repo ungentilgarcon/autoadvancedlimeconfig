@@ -169,7 +169,11 @@ def preflight(nodes: list, changes: list[Change], packages: tuple[str, ...] = ()
         total = 0
         for change in changes:
             before = read_node_file(node, change.path)
-            after = merge_change(change, before)
+            if change.original is None and before is not None:
+                change = Change(change.path, before, change.edited)
+                after = change.edited
+            else:
+                after = merge_change(change, before)
             total += (len(before.data) if before else 0) + (len(after.data) if after else 0)
             if total > MAX_TOTAL_BYTES:
                 raise ArchiveError(f"{node}: merged files exceed the size limit")
@@ -177,6 +181,47 @@ def preflight(nodes: list, changes: list[Change], packages: tuple[str, ...] = ()
         manager = check_packages(node, packages) if packages else None
         plans.append(NodePlan(node, tuple(files), packages, manager))
     return plans
+
+
+def fix_services(changes: list[Change]) -> list[str]:
+    services = []
+    for change in changes:
+        parts = PurePosixPath(change.path).parts
+        if len(parts) == 3 and parts[:2] == ("etc", "init.d"):
+            if change.edited is None or not change.edited.mode & 0o111:
+                raise ArchiveError(f"Fix service must be an executable regular file: /{change.path}")
+            services.append(change.path)
+    return services
+
+
+def activate_fix_services(plans: list[NodePlan], services: list[str]) -> list[str]:
+    completed = []
+    for plan in plans:
+        for path in services:
+            item = next((item for item in plan.files if item.change.path == path), None)
+            if item is None or item.after is None:
+                raise ArchiveError(f"{plan.node}: service /{path} is missing from the deployment plan")
+            service = shlex.quote("/" + safe_path(path))
+            command = (
+                "set -eu; command -v flock >/dev/null; "
+                "exec 9>/root/libremesh-failsafe/operation.lock; flock -n 9; "
+                "test ! -s /root/libremesh-failsafe/cfg-pending; "
+                "test ! -L /etc; test ! -L /etc/init.d; "
+                f"test ! -L {service}; test -f {service}; test -x {service}; "
+                f"test \"$(sha256sum {service} | cut -d' ' -f1)\" = {_digest(item.after)}; "
+                f"{service} enable 9>&-; {service} restart 9>&-"
+            )
+            try:
+                identity.verify_nodes(fleet, [plan.node])
+                _call(plan.node, command, timeout=60)
+            except (ArchiveError, fleet.DeployError, OSError) as error:
+                raise ArchiveError(
+                    f"Files were deployed, but activation failed for {plan.node}: /{path}: {error}. "
+                    f"Completed activations: {', '.join(completed) or 'none'}. "
+                    "Remaining activations were not attempted; inspect services manually."
+                ) from error
+            completed.append(f"{plan.node}: /{path}")
+    return completed
 
 
 def _call(node, command: str, *, timeout: int = 60) -> str:

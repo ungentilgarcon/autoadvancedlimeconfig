@@ -7,6 +7,60 @@ from pathlib import Path
 
 @unittest.skipUnless(shutil.which("node"), "Node.js is required for JavaScript UI tests")
 class PackageOnlyUiTests(unittest.TestCase):
+    def test_single_fix_archive_ui_and_service_confirmation(self):
+        spec = importlib.util.spec_from_file_location(
+            "fleet_config_ui_fix_js", Path(__file__).resolve().parents[1] / "fleet-config-ui.py"
+        )
+        ui = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ui)
+        script = ui.PAGE.decode().split("<script>", 1)[1].split("</script>", 1)[0]
+        harness = r"""
+const vm=require("node:vm"),assert=require("node:assert/strict");
+const script=require("node:fs").readFileSync(0,"utf8");
+class Element {
+ constructor(){this.listeners={};this.files=[];this.value="";this.disabled=false;this.children=[]}
+ addEventListener(name,fn){this.listeners[name]=fn}
+ fire(name){return this.listeners[name]?.({preventDefault(){}})}
+ replaceChildren(){this.children=[]}
+ append(...items){this.children.push(...items)}
+}
+const elements=Object.fromEntries(["form","status","dry","deploy","original","edited","packages","inventory",
+ "mode","results","refresh-nodes","node-status","node-results","target-mode","targets","discover","seed",
+ "firmware","firmware-check","firmware-flash","firmware-status","radio-check"].map(id=>[id,new Element()]));
+elements["target-mode"].value="all";elements.mode.value="none";elements.discover.checked=true;
+let requests=[],promptText="";
+class FileReader {readAsDataURL(file){this.result="data:application/gzip;base64,"+file.data;this.onload()}}
+const ctx={document:{getElementById:id=>elements[id],createElement:()=>new Element(),
+ querySelectorAll:()=>[{value:"/etc/init.d/example"}]},FileReader,
+ fetch:async(path,options)=>{requests.push({path,payload:JSON.parse(options.body)});
+ let data=path==="compare"?{fix_package:true,packages:[],changes:[{path:"/etc/init.d/example",operation:"add",
+ original_mode:null,edited_mode:"0755",added:1,removed:0}]}:
+ path==="dry-run"?{plan_id:"fix",fix_package:true,nodes:["a"],package_managers:[],
+ file_actions:["a: modify /etc/init.d/example"],services:["/etc/init.d/example"]}:
+ {change_id:"id",activated:["a: /etc/init.d/example"]};
+ return {ok:true,json:async()=>data}},
+ prompt:message=>{promptText=message;return "DEPLOY"}};
+vm.runInNewContext(script,ctx);
+(async()=>{
+ elements.edited.files=[{size:10,data:"YWJj"}];
+ elements.edited.fire("change");
+ await elements.form.fire("submit");
+ assert.equal(requests[0].payload.original,null);
+ assert.equal(requests[0].payload.edited,"YWJj");
+ assert.equal(elements.dry.disabled,false);
+ await elements.dry.fire("click");
+ assert.match(elements.status.textContent,/modify/);
+ assert.match(elements.status.textContent,/Services to enable and restart/);
+ await elements.deploy.fire("click");
+ assert.match(promptText,/cannot be automatically rolled back/);
+ assert.match(elements.status.textContent,/Service commands succeeded/);
+})().catch(error=>{console.error(error);process.exitCode=1});
+"""
+        result = subprocess.run(
+            ["node", "-e", harness], input=script, text=True, capture_output=True, check=False
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_identity_review_shows_details_and_requires_confirmation(self):
         spec = importlib.util.spec_from_file_location(
             "fleet_config_ui_identity_js", Path(__file__).resolve().parents[1] / "fleet-config-ui.py"

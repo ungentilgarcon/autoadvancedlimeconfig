@@ -53,8 +53,8 @@ def prepare(nodes: list, inspect_inventory) -> tuple[list[deployment.NodePlan], 
             after = before if path == CONFIG and before is not None else desired[path]
             changes.append(Change(path, before, after))
         plan = deployment.preflight([node], changes)[0]
-        if any(item.before != item.change.original or item.after != item.change.edited
-               for item in plan.files):
+        if any(item.before != change.original or item.after != change.edited
+               for item, change in zip(plan.files, changes)):
             raise ArchiveError(f"{node}: workaround files changed during the dry run; retry")
         plans.append(plan)
     return plans, hostnames

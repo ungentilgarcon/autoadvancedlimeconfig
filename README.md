@@ -860,6 +860,24 @@ the local process/browser memory and are not written into the repository.
 The URL contains an access token; do not share it. The interface listens only
 on `127.0.0.1`.
 
+Alternatively, leave the original backup empty and upload a single `.tar.gz`
+fix archive as the edited file. Its paths must be relative to the router root,
+such as `etc/init.d/example` and `usr/sbin/example`; select the files to deploy.
+Existing regular files are replaced with the archive content and permissions.
+This replacement also applies to files added by a two-backup comparison;
+modifications and deletions still use the existing conflict checks. The dry run
+lists per-node add/modify actions before confirmation, and deployment checks
+that the target files have not changed since preflight.
+
+For a single fix archive, selected executable files directly under
+`etc/init.d/` are enabled and restarted after the file transaction is confirmed.
+Non-executable init scripts are rejected. Service actions are not automatically
+rolled back; if activation fails, the UI reports the completed and remaining
+actions and the change ID. Verify service status and logs manually. A service's
+own configuration may still prevent it from running. Back up node-specific
+settings before replacing them and only upload trusted archives: service scripts
+execute as root.
+
 The UI queries nodes over SSH for their live OpenWrt model and board ID.
 Automatic mesh discovery is enabled by default. It reads LibreMesh shared DNS
 records from a reachable inventory node, or from the optional mesh seed SSH

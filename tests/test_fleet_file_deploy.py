@@ -42,6 +42,38 @@ class PreflightTests(unittest.TestCase):
         remote.assert_called_once()
         push.assert_not_called()
 
+    def test_added_file_replaces_existing_file_with_checked_preimage(self):
+        desired = Entry("file", b"new", 0o755)
+        change = Change("usr/sbin/tool", None, desired)
+        before = Entry("file", b"old", 0o600)
+        with patch.object(deployment.fleet, "remote",
+                          return_value=subprocess.CompletedProcess([], 0, "", "")), \
+             patch.object(deployment, "read_node_file", return_value=before):
+            plan = deployment.preflight([self.node], [change])[0]
+        self.assertEqual(plan.files[0].before, before)
+        self.assertEqual(plan.files[0].after, desired)
+        self.assertEqual(plan.files[0].change.operation, "modify")
+        self.assertTrue(deployment._manifest(plan).startswith(b"modify|usr/sbin/tool|"))
+
+    def test_fix_services_require_executable_direct_init_script(self):
+        service = Change("etc/init.d/test", None, Entry("file", b"script", 0o755))
+        other = Change("usr/sbin/tool", None, Entry("file", b"tool", 0o755))
+        self.assertEqual(deployment.fix_services([service, other]), ["etc/init.d/test"])
+        with self.assertRaisesRegex(ArchiveError, "executable"):
+            deployment.fix_services([Change("etc/init.d/test", None, Entry("file", b"x", 0o644))])
+
+    def test_fix_activation_stops_and_reports_partial_effects(self):
+        service = Change("etc/init.d/test", None, Entry("file", b"script", 0o755))
+        plans = [deployment.NodePlan(node, (deployment.PlannedFile(service, None, service.edited),))
+                 for node in (self.node, deployment.fleet.Node({
+                     "name": "b", "host": "root@192.0.2.2", "mesh_ip": "192.0.2.2"}))]
+        with patch.object(deployment, "_call", side_effect=["", ArchiveError("failure")]) as call:
+            with self.assertRaisesRegex(ArchiveError, "Files were deployed.*Completed activations: a"):
+                deployment.activate_fix_services(plans, [service.path])
+        self.assertIn("sha256sum /etc/init.d/test", call.call_args_list[0].args[1])
+        self.assertIn("/etc/init.d/test enable 9>&-; /etc/init.d/test restart 9>&-",
+                      call.call_args_list[0].args[1])
+
     def test_protected_recovery_helper_rejected(self):
         change = Change("usr/sbin/picot-files-sync", None, Entry("file", b"x", 0o755))
         with self.assertRaises(ArchiveError):

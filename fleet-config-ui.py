@@ -45,14 +45,17 @@ Scheduling and confirmation are best effort, not atomic. Use a test fleet and in
 recovery access. Health checks require Babel and peer pings, not routing convergence.
 The dry run does not validate UCI syntax; opkg checks package availability but not dependencies.
 Packages and their side effects cannot be rolled back, even if a later step fails.</p>
-<p>Upload the original OpenWrt backup and the edited backup. Only changed files under
+<p>Upload the original OpenWrt backup and the edited backup, or upload only an edited
+archive as a fix package. Existing files added by either method will be replaced.
+Selected fix-package services under <code>/etc/init.d</code> are enabled and restarted
+after file deployment; service effects are not rolled back. Only files under
 <code>/etc</code>, <code>/usr/sbin</code> and <code>/opt</code> are shown.
 File contents are not displayed.
 Backups can contain secrets.</p>
 <form id="form">
-<label>Original .tar.gz backup (optional for package-only installs)
+<label>Original .tar.gz backup (optional for fix or package-only installs)
 <input id="original" type="file" accept=".gz,.tgz"></label>
-<label>Edited .tar.gz backup <input id="edited" type="file" accept=".gz,.tgz"></label>
+<label>Edited backup or fix .tar.gz <input id="edited" type="file" accept=".gz,.tgz"></label>
 <label>Packages to install (comma-separated)
 <input id="packages" type="text" placeholder="package-one, package-two"></label>
 <p>For package-only deployments, enter packages and run the dry run without uploading backups.
@@ -206,7 +209,7 @@ form.addEventListener("submit",async event=>{event.preventDefault();status.textC
 results.replaceChildren();uploaded=null;changeCount=0;updateDry();invalidate();const version=revision;
 try {
 const original=originalInput.files[0], edited=editedInput.files[0];
-if(Boolean(original)!==Boolean(edited))throw new Error("Upload both backups or neither");
+if(original&&!edited)throw new Error("Select an edited backup or fix archive");
 if((original&&original.size>33554432)||(edited&&edited.size>33554432))
 throw new Error("Each archive must be at most 32 MiB");
 const payload={original:original?await encoded(original):null,edited:edited?await encoded(edited):null,
@@ -215,7 +218,8 @@ if(version!==revision)return;
 const data=await post("compare",payload);
 if(version!==revision)return;
 uploaded=payload;changeCount=data.changes.length;
-status.textContent=data.changes.length+" changed files. No routers were contacted.";
+status.textContent=data.changes.length+" files in "+(data.fix_package?"fix package":"backup comparison")+
+". No routers were contacted.";
 const p=document.createElement("p");p.id="package-summary";p.textContent="Requested packages: "+
 (data.packages.length?data.packages.join(", "):"none");results.append(p);
 const table=document.createElement("table"), header=document.createElement("tr");
@@ -240,8 +244,11 @@ inventory:inventoryInput.value,mode:document.getElementById("mode").value,
 discover:discoverInput.checked,seed:seedInput.value.trim(),
 target_mode:targetMode.value,targets:targetsInput.value});
 if(version!==revision)return;
-planId=result.plan_id;planNodes=result.nodes;planExcluded=result.excluded_candidates||[];deploy.disabled=false;
+planId=result.plan_id;planKind=result.fix_package?"fix":null;planNodes=result.nodes;
+planExcluded=result.excluded_candidates||[];deploy.disabled=false;
 status.textContent="Dry run passed for: "+result.nodes.join(", ")+". No packages or configuration were applied."+
+(result.file_actions&&result.file_actions.length?" File actions: "+result.file_actions.join("; ")+".":"")+
+(result.services&&result.services.length?" Services to enable and restart: "+result.services.join(", ")+".":"")+
 (planExcluded.length?" Excluded unverified candidates: "+
 planExcluded.map(item=>item.name+" ("+item.error+")").join(", ")+".":"")+
 (result.package_managers.length?" Package managers: "+result.package_managers.join(", ")+".":"");
@@ -264,6 +271,8 @@ const answer=prompt("This will change: "+planNodes.join(", ")+". It may disconne
 (planExcluded.length?"Unverified candidates excluded: "+planExcluded.map(item=>item.name).join(", ")+". ":"")+
 (planKind==="radio"?"The watchdog will be enabled and restarted where its existing setting is enabled; "+
 "activation is not automatically rolled back and can lead to 2.4 GHz radio restarts. ":"")+
+(planKind==="fix"?"Selected init services will be enabled and restarted after file deployment; "+
+"service actions and side effects cannot be automatically rolled back. ":"")+
 "Packages and their dependencies are not rolled back; partial installation may remain. "+
 "File rollback and synchronization are best effort. Type DEPLOY to proceed:");
 if(answer!=="DEPLOY")return;const id=planId,kind=planKind;invalidate();deploying=true;updateDry();
@@ -273,6 +282,8 @@ status.textContent=kind==="radio"?
 "Workaround files deployed. Service restart succeeded on: "+(result.started.join(", ")||"none")+
 ". Disabled by existing settings: "+(result.disabled.join(", ")||"none")+
 ". Check service logs and status. Change ID: "+result.change_id:
+kind==="fix"?"Fix files deployed. Service commands succeeded: "+
+(result.activated.join(", ")||"none")+". Verify service health. Change ID: "+result.change_id:
 "Deployment completed on all nodes. Change ID: "+result.change_id;
 }catch(error){status.textContent="Deployment failed: "+error.message}
 finally{deploying=false;updateDry()}});
@@ -634,7 +645,8 @@ def make_handler(token: str):
                     if plan is None or time.monotonic() - plan[0] > 600:
                         raise ArchiveError("Dry run expired or was already used; run it again")
                     verify_target_boards([item.node for item in plan[1]], plan[3], plan[4])
-                    mode = "none" if plan[2] == "radio" else plan[2]
+                    mode = ("none" if plan[2] == "radio" else
+                            plan[2].removeprefix("fix-") if plan[2].startswith("fix-") else plan[2])
                     result = {"change_id": deployment.deploy(plan[1], mode)}
                     if plan[2] == "radio":
                         try:
@@ -642,6 +654,12 @@ def make_handler(token: str):
                         except ArchiveError as error:
                             raise ArchiveError(f"{error} Change ID: {result['change_id']}.") from error
                         result.update({"started": started, "disabled": disabled})
+                    elif plan[2].startswith("fix-"):
+                        services = deployment.fix_services([item.change for item in plan[1][0].files])
+                        try:
+                            result["activated"] = deployment.activate_fix_services(plan[1], services)
+                        except ArchiveError as error:
+                            raise ArchiveError(f"{error} Change ID: {result['change_id']}.") from error
                 elif action == "nodes":
                     deployment.fleet.load_passwords(deployment.fleet.dl.DEFAULT_PASS_FILE)
                     _, details = resolve_nodes(payload)
@@ -650,12 +668,13 @@ def make_handler(token: str):
                     if not isinstance(payload.get("packages"), str):
                         raise ArchiveError("Invalid comparison request")
                     original_data, edited_data = payload.get("original"), payload.get("edited")
+                    fix_package = original_data is None and edited_data is not None
                     if original_data is None and edited_data is None:
                         changes = []
-                    elif original_data is None or edited_data is None:
-                        raise ArchiveError("Upload both backups or neither")
+                    elif edited_data is None:
+                        raise ArchiveError("An edited backup or fix archive is required")
                     else:
-                        original = read_backup(decode_archive(original_data))
+                        original = read_backup(decode_archive(original_data)) if original_data is not None else {}
                         edited = read_backup(decode_archive(edited_data))
                         changes = compare(original, edited)
                     packages = packages_from_text(payload["packages"])
@@ -668,7 +687,7 @@ def make_handler(token: str):
                                           "original_mode": f"{change.original.mode:04o}" if change.original else None,
                                           "edited_mode": f"{change.edited.mode:04o}" if change.edited else None,
                                           "added": added, "removed": removed})
-                        result = {"changes": items, "packages": packages}
+                        result = {"changes": items, "packages": packages, "fix_package": fix_package}
                     else:
                         plans.clear()
                         selected = payload.get("selected")
@@ -681,6 +700,7 @@ def make_handler(token: str):
                         chosen = [change for change in changes if "/" + change.path in selected]
                         if len(chosen) != len(selected):
                             raise ArchiveError("Selection includes files not in the comparison")
+                        services = deployment.fix_services(chosen) if fix_package else []
                         deployment.fleet.load_passwords(deployment.fleet.dl.DEFAULT_PASS_FILE)
                         nodes, details = resolve_nodes(payload, include_inventory_details=False)
                         nodes, expected = select_targets(
@@ -699,8 +719,14 @@ def make_handler(token: str):
                         }
                         planned = deployment.preflight(nodes, chosen, tuple(packages))
                         plan_id = secrets.token_urlsafe(32)
-                        plans[plan_id] = (time.monotonic(), planned, mode, expected, expected_hostnames)
+                        plans[plan_id] = (time.monotonic(), planned,
+                                          "fix-" + mode if fix_package else mode, expected, expected_hostnames)
                         result = {"plan_id": plan_id, "nodes": [node.name for node in nodes],
+                                  "fix_package": fix_package, "services": ["/" + path for path in services],
+                                  "file_actions": [
+                                      f"{plan.node.name}: {item.change.operation} /{item.change.path}"
+                                      for plan in planned for item in plan.files
+                                  ],
                                   "excluded_candidates": [
                                       {"name": item["name"], "error": item.get("error")}
                                       for item in details

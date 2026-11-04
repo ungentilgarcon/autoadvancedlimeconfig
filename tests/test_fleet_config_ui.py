@@ -83,6 +83,62 @@ class WebTests(unittest.TestCase):
             self.assertIsNone(change["original_mode"])
             self.assertEqual(change["edited_mode"], "0755")
 
+    def test_single_fix_archive_deploys_replacements_and_activates_selected_service(self):
+        fix = base64.b64encode(archive([
+            ("etc/init.d/example", b"#!/bin/sh\n", 0o755),
+            ("usr/sbin/example", b"new", 0o755),
+        ])).decode()
+        payload = {"original": None, "edited": fix, "packages": "", "inventory": "",
+                   "discover": True, "seed": "root@192.0.2.1", "target_mode": "all",
+                   "targets": "", "mode": "none"}
+        node = ui.deployment.fleet.Node({"name": "a", "host": "root@192.0.2.1",
+                                         "mesh_ip": "192.0.2.1"})
+        with patch.object(ui.deployment.fleet, "load_passwords"), \
+             patch.object(ui, "resolve_nodes", return_value=([node], [])), \
+             patch.object(ui.deployment.fleet, "remote",
+                          return_value=subprocess.CompletedProcess([], 0, "", "")), \
+             patch.object(ui.deployment, "read_node_file",
+                          side_effect=lambda n, p: ui.deployment.Entry("file", b"old", 0o755)
+                          if p == "usr/sbin/example" else None), \
+             patch.object(ui.deployment, "deploy", return_value="web-fix") as deploy, \
+             patch.object(ui.deployment, "activate_fix_services", return_value=["a: /etc/init.d/example"]) as activate:
+            with self.post("compare", payload) as response:
+                data = json.load(response)
+            self.assertTrue(data["fix_package"])
+            payload["selected"] = [item["path"] for item in data["changes"]]
+            with self.post("dry-run", payload) as response:
+                plan = json.load(response)
+            self.assertEqual(plan["services"], ["/etc/init.d/example"])
+            self.assertIn("a: modify /usr/sbin/example", plan["file_actions"])
+            deploy.assert_not_called()
+            activate.assert_not_called()
+            with self.post("deploy", {"plan_id": plan["plan_id"], "confirmation": "DEPLOY"}) as response:
+                result = json.load(response)
+            self.assertEqual(result["activated"], ["a: /etc/init.d/example"])
+            self.assertEqual(deploy.call_args.args[1], "none")
+            activate.assert_called_once()
+
+    def test_fix_service_activation_failure_reports_committed_change(self):
+        fix = base64.b64encode(archive([("etc/init.d/example", b"script", 0o755)])).decode()
+        payload = {"original": None, "edited": fix, "packages": "", "inventory": "",
+                   "discover": True, "seed": "root@192.0.2.1", "target_mode": "all",
+                   "targets": "", "mode": "none", "selected": ["/etc/init.d/example"]}
+        node = ui.deployment.fleet.Node({"name": "a", "host": "root@192.0.2.1",
+                                         "mesh_ip": "192.0.2.1"})
+        with patch.object(ui.deployment.fleet, "load_passwords"), \
+             patch.object(ui, "resolve_nodes", return_value=([node], [])), \
+             patch.object(ui.deployment.fleet, "remote",
+                          return_value=subprocess.CompletedProcess([], 0, "", "")), \
+             patch.object(ui.deployment, "read_node_file", return_value=None), \
+             patch.object(ui.deployment, "deploy", return_value="web-fix"), \
+             patch.object(ui.deployment, "activate_fix_services",
+                          side_effect=ui.ArchiveError("files were deployed but activation failed")):
+            with self.post("dry-run", payload) as response:
+                plan = json.load(response)
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                self.post("deploy", {"plan_id": plan["plan_id"], "confirmation": "DEPLOY"})
+            self.assertIn("Change ID: web-fix", error.exception.read().decode())
+
     def test_wrong_token_rejected(self):
         with self.assertRaises(urllib.error.HTTPError) as error:
             urllib.request.urlopen(self.origin + "/wrong/")
